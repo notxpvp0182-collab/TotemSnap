@@ -856,6 +856,7 @@ jobs:
           import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
           import net.fabricmc.loader.api.FabricLoader;
           import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.screen.ingame.InventoryScreen;
           import net.minecraft.client.option.KeyBinding;
           import net.minecraft.client.util.InputUtil;
           import net.minecraft.util.Identifier;
@@ -914,20 +915,35 @@ jobs:
                   syncKeyBindingToConfigIfChanged(client);
                   this.swapController.onClientTick(client);
 
-                  // Consume all queued presses so holding or pressing once triggers at most one swap per physical press
                   boolean pressedEvent = false;
                   while (this.activateKeyBinding.wasPressed()) {
                       pressedEvent = true;
                   }
 
-                  boolean currentlyDown = this.activateKeyBinding.isPressed();
-                  if (pressedEvent && !this.wasKeyDownLastTick) {
-                      // Only activate during normal gameplay when no GUI screen is open
-                      if (client.currentScreen == null) {
-                          this.swapController.tryActivateOnce(client);
-                      }
+                  boolean allowedScreen = client.currentScreen == null || client.currentScreen instanceof InventoryScreen;
+                  boolean currentlyDown = allowedScreen && (this.activateKeyBinding.isPressed() || isBoundKeyCurrentlyDown(client));
+
+                  if ((pressedEvent || currentlyDown) && !this.wasKeyDownLastTick && allowedScreen) {
+                      this.swapController.tryActivateOnce(client);
                   }
                   this.wasKeyDownLastTick = currentlyDown;
+              }
+
+              private boolean isBoundKeyCurrentlyDown(MinecraftClient client) {
+                  if (client == null || client.getWindow() == null || this.activateKeyBinding == null || this.activateKeyBinding.isUnbound()) {
+                      return false;
+                  }
+                  InputUtil.Key boundKey = KeyBindingHelper.getBoundKeyOf(this.activateKeyBinding);
+                  if (boundKey == null || boundKey.getCode() == GLFW.GLFW_KEY_UNKNOWN) {
+                      return false;
+                  }
+                  long handle = client.getWindow().getHandle();
+                  if (boundKey.getCategory() == InputUtil.Type.KEYSYM) {
+                      return InputUtil.isKeyPressed(handle, boundKey.getCode());
+                  } else if (boundKey.getCategory() == InputUtil.Type.MOUSE) {
+                      return GLFW.glfwGetMouseButton(handle, boundKey.getCode()) == GLFW.GLFW_PRESS;
+                  }
+                  return false;
               }
 
               public void applyConfiguredKeyToBinding(TotemSnapConfig config) {
@@ -989,6 +1005,7 @@ jobs:
           import dev.totemsnap.logic.SwapPlan;
           import dev.totemsnap.logic.SwapPlanner;
           import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.screen.ingame.InventoryScreen;
           import net.minecraft.client.network.ClientPlayerEntity;
           import net.minecraft.client.network.ClientPlayerInteractionManager;
           import net.minecraft.entity.player.PlayerInventory;
@@ -999,16 +1016,13 @@ jobs:
           import net.minecraft.text.Text;
           import net.minecraft.util.Formatting;
 
-          /**
-           * Handles legitimate client-to-server offhand Totem swaps using ClientPlayerInteractionManager#clickSlot.
-           * Never opens an inventory GUI, never fabricates packets, and reconciles state across ticks.
-           */
           public final class TotemSwapController {
               private static final int VERIFICATION_TIMEOUT_TICKS = 12;
 
               private final TotemSnapConfigManager configManager;
               private boolean awaitingServerVerification = false;
               private int verificationTicksRemaining = 0;
+              private boolean openedInventoryTemporarily = false;
 
               public TotemSwapController(TotemSnapConfigManager configManager) {
                   this.configManager = configManager;
@@ -1017,11 +1031,13 @@ jobs:
               public void resetState() {
                   this.awaitingServerVerification = false;
                   this.verificationTicksRemaining = 0;
+                  this.openedInventoryTemporarily = false;
               }
 
               public void onClientTick(MinecraftClient client) {
                   TotemSnapConfig config = this.configManager.getConfig();
                   if (!config.isEnabled()) {
+                      closeTemporaryInventoryIfNeeded(client);
                       resetState();
                       return;
                   }
@@ -1039,17 +1055,18 @@ jobs:
 
                   if (this.awaitingServerVerification) {
                       if (player.getOffHandStack().isOf(Items.TOTEM_OF_UNDYING)) {
-                          // Swap confirmed in offhand; ensure cursor holds nothing left over
-                          this.awaitingServerVerification = false;
-                          this.verificationTicksRemaining = 0;
+                          reconcileCursorIfNeeded(client, player);
+                          closeTemporaryInventoryIfNeeded(client);
+                          resetState();
                           if (config.isShowOperationStatusMessages()) {
                               sendHudMessage(player, Text.translatable("message.totemsnap.swapped").formatted(Formatting.AQUA));
                           }
                       } else {
                           this.verificationTicksRemaining--;
                           if (this.verificationTicksRemaining <= 0) {
-                              this.awaitingServerVerification = false;
                               reconcileCursorIfNeeded(client, player);
+                              closeTemporaryInventoryIfNeeded(client);
+                              resetState();
                               if (config.isShowOperationStatusMessages()) {
                                   sendHudMessage(player, Text.translatable("message.totemsnap.rejected").formatted(Formatting.RED));
                               }
@@ -1077,13 +1094,12 @@ jobs:
                       return;
                   }
 
-                  // Requirement 6: Never open inventory GUI; only act when playerScreenHandler is active and no screen is open
-                  if (client.currentScreen != null || player.currentScreenHandler != player.playerScreenHandler) {
+                  boolean inventoryAlreadyOpen = client.currentScreen instanceof InventoryScreen;
+                  if (client.currentScreen != null && !inventoryAlreadyOpen) {
                       return;
                   }
 
-                  // Avoid overlapping swaps while waiting for server verification
-                  if (this.awaitingServerVerification) {
+                  if (player.currentScreenHandler != player.playerScreenHandler || this.awaitingServerVerification) {
                       return;
                   }
 
@@ -1107,19 +1123,27 @@ jobs:
                               sendHudMessage(player, Text.translatable("message.totemsnap.no_space").formatted(Formatting.GOLD));
                           }
                       }
-                      case EXECUTE_SWAP -> executeSwapPlan(interactionManager, player, plan);
+                      case EXECUTE_SWAP -> executeSwapPlan(client, interactionManager, player, plan, inventoryAlreadyOpen);
                   }
               }
 
               private void executeSwapPlan(
+                      MinecraftClient client,
                       ClientPlayerInteractionManager interactionManager,
                       ClientPlayerEntity player,
-                      SwapPlan plan
+                      SwapPlan plan,
+                      boolean inventoryAlreadyOpen
               ) {
-                  PlayerScreenHandler handler = player.playerScreenHandler;
-                  int syncId = handler.syncId;
-
+                  boolean openedNow = false;
                   try {
+                      if (!inventoryAlreadyOpen && client.currentScreen == null) {
+                          client.setScreen(new InventoryScreen(player));
+                          openedNow = true;
+                      }
+
+                      PlayerScreenHandler handler = player.playerScreenHandler;
+                      int syncId = handler.syncId;
+
                       for (SwapPlan.ClickStep step : plan.steps()) {
                           SlotActionType actionType = step.actionKind() == SwapPlan.ActionKind.HOTBAR_SWAP
                                   ? SlotActionType.SWAP
@@ -1127,14 +1151,39 @@ jobs:
                           interactionManager.clickSlot(syncId, step.handlerSlot(), step.button(), actionType, player);
                       }
 
-                      // Reconcile if cursor unexpectedly retained an item due to immediate local rejection
-                      reconcileCursorIfNeeded(MinecraftClient.getInstance(), player);
+                      reconcileCursorIfNeeded(client, player);
 
-                      this.awaitingServerVerification = true;
-                      this.verificationTicksRemaining = VERIFICATION_TIMEOUT_TICKS;
+                      if (player.getOffHandStack().isOf(Items.TOTEM_OF_UNDYING) && handler.getCursorStack().isEmpty()) {
+                          if (openedNow) {
+                              player.closeHandledScreen();
+                          }
+                          resetState();
+                          if (this.configManager.getConfig().isShowOperationStatusMessages()) {
+                              sendHudMessage(player, Text.translatable("message.totemsnap.swapped").formatted(Formatting.AQUA));
+                          }
+                      } else {
+                          this.openedInventoryTemporarily = openedNow;
+                          this.awaitingServerVerification = true;
+                          this.verificationTicksRemaining = VERIFICATION_TIMEOUT_TICKS;
+                      }
                   } catch (Exception ex) {
                       TotemSnapMod.LOGGER.warn("TotemSnap swap interaction failed safely", ex);
+                      if (openedNow) {
+                          closeTemporaryInventoryIfNeeded(client);
+                      }
                       resetState();
+                  }
+              }
+
+              private void closeTemporaryInventoryIfNeeded(MinecraftClient client) {
+                  if (!this.openedInventoryTemporarily || client == null) {
+                      return;
+                  }
+                  this.openedInventoryTemporarily = false;
+                  if (client.player != null && client.currentScreen instanceof InventoryScreen) {
+                      client.player.closeHandledScreen();
+                  } else if (client.currentScreen instanceof InventoryScreen) {
+                      client.setScreen(null);
                   }
               }
 
@@ -1146,7 +1195,6 @@ jobs:
                   if (handler.getCursorStack().isEmpty()) {
                       return;
                   }
-                  // Find an empty slot in the player's main/hotbar handler slots (9..44) to safely return any stranded cursor stack
                   for (int slotId = 9; slotId <= 44; slotId++) {
                       if (handler.getSlot(slotId).getStack().isEmpty()) {
                           client.interactionManager.clickSlot(handler.syncId, slotId, 0, SlotActionType.PICKUP, player);
