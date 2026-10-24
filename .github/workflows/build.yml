@@ -939,7 +939,7 @@ jobs:
                   }
                   long handle = client.getWindow().getHandle();
                   if (boundKey.getCategory() == InputUtil.Type.KEYSYM) {
-                      return InputUtil.isKeyPressed(handle, boundKey.getCode());
+                      return InputUtil.isKeyPressed(client.getWindow(), boundKey.getCode());
                   } else if (boundKey.getCategory() == InputUtil.Type.MOUSE) {
                       return GLFW.glfwGetMouseButton(handle, boundKey.getCode()) == GLFW.GLFW_PRESS;
                   }
