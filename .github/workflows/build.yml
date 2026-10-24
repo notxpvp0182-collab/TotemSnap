@@ -1,0 +1,1746 @@
+name: Build TotemSnap (MC 1.21.11)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  MOD_NAME: "TotemSnap"
+  MOD_ID: "totemsnap"
+  MOD_VERSION: "1.0.0"
+  MINECRAFT_VERSION: "1.21.11"
+  YARN_MAPPINGS: "1.21.11+build.6"
+  LOADER_VERSION: "0.19.5"
+  FABRIC_API_VERSION: "0.141.6+1.21.11"
+  MODMENU_VERSION: "17.0.1"
+  LOOM_VERSION: "1.14-SNAPSHOT"
+  GRADLE_VERSION: "9.2.1"
+
+jobs:
+  generate-and-build:
+    name: Generate Project, Test & Build JAR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Gradle Caching & Bootstrap Environment
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Resolve Compatible 1.21.11 Dependency Versions
+        id: resolve_deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - << 'PYEOF'
+          import json, os, urllib.request
+
+          mc_ver = os.environ.get("MINECRAFT_VERSION", "1.21.11")
+          yarn_ver = os.environ.get("YARN_MAPPINGS", "1.21.11+build.6")
+          loader_ver = os.environ.get("LOADER_VERSION", "0.19.5")
+          fapi_ver = os.environ.get("FABRIC_API_VERSION", "0.141.6+1.21.11")
+          modmenu_ver = os.environ.get("MODMENU_VERSION", "17.0.1")
+
+          def fetch_json(url):
+              req = urllib.request.Request(url, headers={"User-Agent": "TotemSnap-CI/1.0"})
+              with urllib.request.urlopen(req, timeout=15) as resp:
+                  return json.loads(resp.read().decode("utf-8"))
+
+          try:
+              yarn_data = fetch_json(f"https://meta.fabricmc.net/v2/versions/yarn/{mc_ver}")
+              if yarn_data and isinstance(yarn_data, list):
+                  yarn_ver = yarn_data[0]["version"]
+          except Exception as e:
+              print(f"Using pinned Yarn fallback ({yarn_ver}): {e}")
+
+          try:
+              loader_data = fetch_json("https://meta.fabricmc.net/v2/versions/loader")
+              stable_loaders = [x["version"] for x in loader_data if x.get("stable")]
+              if stable_loaders:
+                  loader_ver = stable_loaders[0]
+          except Exception as e:
+              print(f"Using pinned Loader fallback ({loader_ver}): {e}")
+
+          try:
+              fapi_url = f'https://api.modrinth.com/v2/project/P7dR8mSH/version?game_versions=%5B%22{mc_ver}%22%5D&loaders=%5B%22fabric%22%5D'
+              fapi_data = fetch_json(fapi_url)
+              if fapi_data and isinstance(fapi_data, list):
+                  fapi_ver = fapi_data[0]["version_number"]
+          except Exception as e:
+              print(f"Using pinned Fabric API fallback ({fapi_ver}): {e}")
+
+          try:
+              mm_url = f'https://api.modrinth.com/v2/project/mOgUt4GM/version?game_versions=%5B%22{mc_ver}%22%5D&loaders=%5B%22fabric%22%5D'
+              mm_data = fetch_json(mm_url)
+              if mm_data and isinstance(mm_data, list):
+                  modmenu_ver = mm_data[0]["version_number"]
+          except Exception as e:
+              print(f"Using pinned Mod Menu fallback ({modmenu_ver}): {e}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"yarn_mappings={yarn_ver}\n")
+              out.write(f"loader_version={loader_ver}\n")
+              out.write(f"fabric_api_version={fapi_ver}\n")
+              out.write(f"modmenu_version={modmenu_ver}\n")
+
+          print(f"Resolved Yarn: {yarn_ver}")
+          print(f"Resolved Loader: {loader_ver}")
+          print(f"Resolved Fabric API: {fapi_ver}")
+          print(f"Resolved Mod Menu: {modmenu_ver}")
+          PYEOF
+
+      - name: Generate Complete TotemSnap Project Structure & Source Files
+        shell: bash
+        env:
+          RESOLVED_YARN: ${{ steps.resolve_deps.outputs.yarn_mappings }}
+          RESOLVED_LOADER: ${{ steps.resolve_deps.outputs.loader_version }}
+          RESOLVED_FAPI: ${{ steps.resolve_deps.outputs.fabric_api_version }}
+          RESOLVED_MODMENU: ${{ steps.resolve_deps.outputs.modmenu_version }}
+        run: |
+          set -euo pipefail
+          python3 - << 'PYEOF'
+          import base64, os, pathlib, struct, zlib
+
+          def write_file(rel_path: str, content: str):
+              path = pathlib.Path(rel_path)
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(content.lstrip("\n"), encoding="utf-8")
+              print(f"Generated: {rel_path}")
+
+          def generate_icon(rel_path: str):
+              path = pathlib.Path(rel_path)
+              path.parent.mkdir(parents=True, exist_ok=True)
+              width, height = 64, 64
+              raw_rows = bytearray()
+              for y in range(height):
+                  raw_rows.append(0)
+                  for x in range(width):
+                      border = x < 3 or x >= width - 3 or y < 3 or y >= height - 3
+                      totem_cross = (20 <= x < 44 and 22 <= y < 30) or (26 <= x < 38 and 14 <= y < 50)
+                      eyes = (24 <= x < 28 or 36 <= x < 40) and (24 <= y < 28)
+                      if border:
+                          raw_rows.extend((0, 212, 255, 255))       # Cyan accent border
+                      elif eyes:
+                          raw_rows.extend((0, 255, 220, 255))       # Glowing cyan eyes
+                      elif totem_cross:
+                          raw_rows.extend((230, 195, 92, 255))      # Golden totem body
+                      else:
+                          raw_rows.extend((18, 22, 31, 255))        # Dark slate background
+
+              def png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+                  crc = zlib.crc32(chunk_type + data) & 0xffffffff
+                  return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", crc)
+
+              ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+              idat = zlib.compress(bytes(raw_rows), 9)
+              png_bytes = b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", ihdr) + png_chunk(b"IDAT", idat) + png_chunk(b"IEND", b"")
+              path.write_bytes(png_bytes)
+              print(f"Generated icon: {rel_path}")
+
+          mc_ver = os.environ["MINECRAFT_VERSION"]
+          yarn_ver = os.environ["RESOLVED_YARN"]
+          loader_ver = os.environ["RESOLVED_LOADER"]
+          fapi_ver = os.environ["RESOLVED_FAPI"]
+          modmenu_ver = os.environ["RESOLVED_MODMENU"]
+          mod_ver = os.environ["MOD_VERSION"]
+
+          write_file(".gitignore", """
+          .gradle/
+          build/
+          run/
+          out/
+          *.iml
+          *.ipr
+          *.iws
+          .idea/
+          .vscode/
+          .DS_Store
+          """)
+
+          write_file("settings.gradle", """
+          pluginManagement {
+              repositories {
+                  maven {
+                      name = 'Fabric'
+                      url = 'https://maven.fabricmc.net/'
+                  }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          rootProject.name = 'TotemSnap'
+          """)
+
+          write_file("gradle.properties", f"""
+          org.gradle.jvmargs=-Xmx2G -XX:+UseParallelGC
+          org.gradle.parallel=true
+          minecraft_version={mc_ver}
+          yarn_mappings={yarn_ver}
+          loader_version={loader_ver}
+          fabric_version={fapi_ver}
+          modmenu_version={modmenu_ver}
+          mod_version={mod_ver}
+          maven_group=dev.totemsnap
+          archives_base_name=TotemSnap
+          """)
+
+          write_file("build.gradle", """
+          plugins {
+              id 'fabric-loom' version '1.14-SNAPSHOT'
+              id 'maven-publish'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          repositories {
+              mavenCentral()
+              maven {
+                  name = "Fabric"
+                  url = "https://maven.fabricmc.net/"
+              }
+              maven {
+                  name = "TerraformersMC"
+                  url = "https://maven.terraformersmc.com/releases/"
+              }
+              maven {
+                  name = "Modrinth"
+                  url = "https://api.modrinth.com/maven"
+                  content {
+                      includeGroup "maven.modrinth"
+                  }
+              }
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+              // Mod Menu is optional at runtime and never bundled inside TotemSnap.jar
+              modCompileOnly "com.terraformersmc:modmenu:${project.modmenu_version}"
+              modLocalRuntime "com.terraformersmc:modmenu:${project.modmenu_version}"
+
+              testImplementation "org.junit.jupiter:junit-jupiter:5.11.3"
+              testRuntimeOnly "org.junit.platform:junit-platform-launcher:1.11.3"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              inputs.property "minecraft_version", project.minecraft_version
+              inputs.property "loader_version", project.loader_version
+
+              filesMatching("fabric.mod.json") {
+                  expand(
+                      "version": project.version,
+                      "minecraft_version": project.minecraft_version,
+                      "loader_version": project.loader_version
+                  )
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 21
+              it.options.encoding = "UTF-8"
+          }
+
+          java {
+              withSourcesJar()
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+
+          test {
+              useJUnitPlatform()
+              testLogging {
+                  events "passed", "skipped", "failed"
+                  exceptionFormat "full"
+              }
+          }
+
+          remapJar {
+              archiveFileName = "TotemSnap.jar"
+          }
+
+          jar {
+              from("LICENSE") {
+                  rename { "${it}_${project.base.archivesName.get()}" }
+              }
+          }
+          """)
+
+          write_file("src/main/resources/fabric.mod.json", """
+          {
+            "schemaVersion": 1,
+            "id": "totemsnap",
+            "version": "${version}",
+            "name": "TotemSnap",
+            "description": "Responsive one-key offhand Totem of Undying swapper with safe offhand preservation, zero GUI opening, and Mod Menu configuration.",
+            "authors": [
+              "TotemSnap Contributors"
+            ],
+            "contact": {
+              "homepage": "https://github.com/",
+              "sources": "https://github.com/"
+            },
+            "license": "MIT",
+            "icon": "assets/totemsnap/icon.png",
+            "environment": "client",
+            "entrypoints": {
+              "main": [
+                "dev.totemsnap.TotemSnapMod"
+              ],
+              "client": [
+                "dev.totemsnap.client.TotemSnapClient"
+              ],
+              "modmenu": [
+                "dev.totemsnap.compat.ModMenuIntegration"
+              ]
+            },
+            "depends": {
+              "fabricloader": ">=${loader_version}",
+              "minecraft": "~${minecraft_version}",
+              "java": ">=21",
+              "fabric-api": "*"
+            },
+            "suggests": {
+              "modmenu": "*"
+            }
+          }
+          """)
+
+          write_file("src/main/resources/assets/totemsnap/lang/en_us.json", """
+          {
+            "key.category.totemsnap.general": "TotemSnap",
+            "key.totemsnap.activate": "TotemSnap Activate",
+            "screen.totemsnap.config.title": "TotemSnap Configuration",
+            "screen.totemsnap.config.subtitle": "One-Key Offhand Totem Utility • Minecraft 1.21.11",
+            "option.totemsnap.enabled": "TotemSnap Enabled",
+            "option.totemsnap.keybind": "Activation Keybind",
+            "option.totemsnap.show_missing_message": "Show Missing Totem Message",
+            "option.totemsnap.show_status_messages": "Show Operation Status Messages",
+            "option.totemsnap.prefer_hotbar": "Prefer Hotbar Totems First",
+            "button.totemsnap.restore_defaults": "Restore Default Settings",
+            "button.totemsnap.save": "Save & Close",
+            "button.totemsnap.cancel": "Cancel",
+            "message.totemsnap.no_totem": "TotemSnap: No Totem found!",
+            "message.totemsnap.already_equipped": "TotemSnap: Totem already in offhand.",
+            "message.totemsnap.swapped": "TotemSnap: Equipped Totem of Undying.",
+            "message.totemsnap.no_space": "TotemSnap: No safe slot to preserve current offhand item!",
+            "message.totemsnap.rejected": "TotemSnap: Swap rejected or rolled back by server."
+          }
+          """)
+
+          generate_icon("src/main/resources/assets/totemsnap/icon.png")
+
+          write_file("src/main/java/dev/totemsnap/TotemSnapMod.java", """
+          package dev.totemsnap;
+
+          import net.fabricmc.api.ModInitializer;
+          import org.slf4j.Logger;
+          import org.slf4j.LoggerFactory;
+
+          public final class TotemSnapMod implements ModInitializer {
+              public static final String MOD_ID = "totemsnap";
+              public static final String MOD_NAME = "TotemSnap";
+              public static final Logger LOGGER = LoggerFactory.getLogger(MOD_NAME);
+
+              @Override
+              public void onInitialize() {
+                  LOGGER.info("{} initialized for Minecraft 1.21.11.", MOD_NAME);
+              }
+          }
+          """)
+
+          write_file("src/main/java/dev/totemsnap/config/TotemSnapConfig.java", """
+          package dev.totemsnap.config;
+
+          import java.util.Objects;
+
+          public final class TotemSnapConfig {
+              public static final String DEFAULT_KEY_TRANSLATION = "key.keyboard.r";
+
+              private boolean enabled = true;
+              private boolean showMissingTotemMessage = true;
+              private boolean showOperationStatusMessages = false;
+              private boolean preferHotbarTotem = true;
+              private String boundKeyTranslationKey = DEFAULT_KEY_TRANSLATION;
+
+              public TotemSnapConfig() {
+              }
+
+              public TotemSnapConfig copy() {
+                  TotemSnapConfig copy = new TotemSnapConfig();
+                  copy.enabled = this.enabled;
+                  copy.showMissingTotemMessage = this.showMissingTotemMessage;
+                  copy.showOperationStatusMessages = this.showOperationStatusMessages;
+                  copy.preferHotbarTotem = this.preferHotbarTotem;
+                  copy.boundKeyTranslationKey = this.boundKeyTranslationKey;
+                  copy.sanitize();
+                  return copy;
+              }
+
+              public void restoreDefaults() {
+                  this.enabled = true;
+                  this.showMissingTotemMessage = true;
+                  this.showOperationStatusMessages = false;
+                  this.preferHotbarTotem = true;
+                  this.boundKeyTranslationKey = DEFAULT_KEY_TRANSLATION;
+              }
+
+              public boolean sanitize() {
+                  boolean modified = false;
+                  if (this.boundKeyTranslationKey == null || this.boundKeyTranslationKey.isBlank()) {
+                      this.boundKeyTranslationKey = DEFAULT_KEY_TRANSLATION;
+                      modified = true;
+                  } else {
+                      String trimmed = this.boundKeyTranslationKey.trim();
+                      if (!trimmed.startsWith("key.keyboard.") && !trimmed.startsWith("key.mouse.")) {
+                          this.boundKeyTranslationKey = DEFAULT_KEY_TRANSLATION;
+                          modified = true;
+                      } else if (!trimmed.equals(this.boundKeyTranslationKey)) {
+                          this.boundKeyTranslationKey = trimmed;
+                          modified = true;
+                      }
+                  }
+                  return modified;
+              }
+
+              public boolean isEnabled() {
+                  return enabled;
+              }
+
+              public void setEnabled(boolean enabled) {
+                  this.enabled = enabled;
+              }
+
+              public boolean isShowMissingTotemMessage() {
+                  return showMissingTotemMessage;
+              }
+
+              public void setShowMissingTotemMessage(boolean showMissingTotemMessage) {
+                  this.showMissingTotemMessage = showMissingTotemMessage;
+              }
+
+              public boolean isShowOperationStatusMessages() {
+                  return showOperationStatusMessages;
+              }
+
+              public void setShowOperationStatusMessages(boolean showOperationStatusMessages) {
+                  this.showOperationStatusMessages = showOperationStatusMessages;
+              }
+
+              public boolean isPreferHotbarTotem() {
+                  return preferHotbarTotem;
+              }
+
+              public void setPreferHotbarTotem(boolean preferHotbarTotem) {
+                  this.preferHotbarTotem = preferHotbarTotem;
+              }
+
+              public String getBoundKeyTranslationKey() {
+                  return boundKeyTranslationKey;
+              }
+
+              public void setBoundKeyTranslationKey(String boundKeyTranslationKey) {
+                  this.boundKeyTranslationKey = boundKeyTranslationKey;
+                  sanitize();
+              }
+
+              @Override
+              public boolean equals(Object o) {
+                  if (this == o) return true;
+                  if (!(o instanceof TotemSnapConfig that)) return false;
+                  return enabled == that.enabled
+                          && showMissingTotemMessage == that.showMissingTotemMessage
+                          && showOperationStatusMessages == that.showOperationStatusMessages
+                          && preferHotbarTotem == that.preferHotbarTotem
+                          && Objects.equals(boundKeyTranslationKey, that.boundKeyTranslationKey);
+              }
+
+              @Override
+              public int hashCode() {
+                  return Objects.hash(enabled, showMissingTotemMessage, showOperationStatusMessages, preferHotbarTotem, boundKeyTranslationKey);
+              }
+          }
+          """)
+
+          write_file("src/main/java/dev/totemsnap/config/TotemSnapConfigManager.java", """
+          package dev.totemsnap.config;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import com.google.gson.JsonObject;
+          import com.google.gson.JsonParser;
+          import org.slf4j.Logger;
+          import org.slf4j.LoggerFactory;
+
+          import java.io.IOException;
+          import java.io.Reader;
+          import java.io.Writer;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.nio.file.StandardCopyOption;
+
+          public final class TotemSnapConfigManager {
+              private static final Logger LOGGER = LoggerFactory.getLogger("TotemSnapConfig");
+              private static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
+
+              private final Path configPath;
+              private TotemSnapConfig config;
+
+              public TotemSnapConfigManager(Path configPath) {
+                  this.configPath = configPath;
+                  this.config = new TotemSnapConfig();
+              }
+
+              public synchronized TotemSnapConfig getConfig() {
+                  return this.config;
+              }
+
+              public synchronized TotemSnapConfig load() {
+                  if (!Files.exists(configPath)) {
+                      this.config = new TotemSnapConfig();
+                      save();
+                      return this.config;
+                  }
+
+                  try (Reader reader = Files.newBufferedReader(configPath, StandardCharsets.UTF_8)) {
+                      JsonObject json = JsonParser.parseReader(reader).getAsJsonObject();
+                      TotemSnapConfig loaded = new TotemSnapConfig();
+
+                      boolean dirty = false;
+                      if (json.has("enabled") && json.get("enabled").isJsonPrimitive() && json.get("enabled").getAsJsonPrimitive().isBoolean()) {
+                          loaded.setEnabled(json.get("enabled").getAsBoolean());
+                      } else {
+                          dirty = true;
+                      }
+
+                      if (json.has("showMissingTotemMessage") && json.get("showMissingTotemMessage").isJsonPrimitive()
+                              && json.get("showMissingTotemMessage").getAsJsonPrimitive().isBoolean()) {
+                          loaded.setShowMissingTotemMessage(json.get("showMissingTotemMessage").getAsBoolean());
+                      } else {
+                          dirty = true;
+                      }
+
+                      if (json.has("showOperationStatusMessages") && json.get("showOperationStatusMessages").isJsonPrimitive()
+                              && json.get("showOperationStatusMessages").getAsJsonPrimitive().isBoolean()) {
+                          loaded.setShowOperationStatusMessages(json.get("showOperationStatusMessages").getAsBoolean());
+                      } else {
+                          dirty = true;
+                      }
+
+                      if (json.has("preferHotbarTotem") && json.get("preferHotbarTotem").isJsonPrimitive()
+                              && json.get("preferHotbarTotem").getAsJsonPrimitive().isBoolean()) {
+                          loaded.setPreferHotbarTotem(json.get("preferHotbarTotem").getAsBoolean());
+                      } else {
+                          dirty = true;
+                      }
+
+                      if (json.has("boundKeyTranslationKey") && json.get("boundKeyTranslationKey").isJsonPrimitive()
+                              && json.get("boundKeyTranslationKey").getAsJsonPrimitive().isString()) {
+                          loaded.setBoundKeyTranslationKey(json.get("boundKeyTranslationKey").getAsString());
+                      } else {
+                          dirty = true;
+                      }
+
+                      if (loaded.sanitize() || dirty) {
+                          this.config = loaded;
+                          save();
+                      } else {
+                          this.config = loaded;
+                      }
+                  } catch (Exception ex) {
+                      LOGGER.warn("Invalid or corrupted TotemSnap config at {}. Restoring safe defaults.", configPath, ex);
+                      this.config = new TotemSnapConfig();
+                      save();
+                  }
+
+                  return this.config;
+              }
+
+              public synchronized void updateAndSave(TotemSnapConfig updated) {
+                  if (updated == null) {
+                      this.config = new TotemSnapConfig();
+                  } else {
+                      this.config = updated.copy();
+                  }
+                  save();
+              }
+
+              public synchronized void save() {
+                  try {
+                      Path parent = configPath.getParent();
+                      if (parent != null) {
+                          Files.createDirectories(parent);
+                      }
+                      this.config.sanitize();
+                      Path tempFile = configPath.resolveSibling(configPath.getFileName().toString() + ".tmp");
+                      try (Writer writer = Files.newBufferedWriter(tempFile, StandardCharsets.UTF_8)) {
+                          GSON.toJson(this.config, writer);
+                      }
+                      Files.move(tempFile, configPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                  } catch (IOException ex) {
+                      try {
+                          try (Writer writer = Files.newBufferedWriter(configPath, StandardCharsets.UTF_8)) {
+                              GSON.toJson(this.config, writer);
+                          }
+                      } catch (IOException fallbackEx) {
+                          LOGGER.error("Failed to save TotemSnap configuration to {}", configPath, fallbackEx);
+                      }
+                  }
+              }
+
+              public Path getConfigPath() {
+                  return configPath;
+              }
+          }
+          """)
+
+          write_file("src/main/java/dev/totemsnap/logic/SlotState.java", """
+          package dev.totemsnap.logic;
+
+          public enum SlotState {
+              EMPTY,
+              TOTEM,
+              OTHER
+          }
+          """)
+
+          write_file("src/main/java/dev/totemsnap/logic/InventorySnapshot.java", """
+          package dev.totemsnap.logic;
+
+          import java.util.Arrays;
+          import java.util.Objects;
+
+          /**
+           * Pure, immutable representation of the player's accessible inventory state:
+           * - mainSlots[0..8]: Hotbar slots (mapped to ScreenHandler slots 36..44)
+           * - mainSlots[9..35]: Main storage slots (mapped to ScreenHandler slots 9..35)
+           * - offhandSlot: Offhand slot (ScreenHandler slot 45)
+           * - cursorEmpty: Whether the player's cursor stack is currently empty
+           */
+          public final class InventorySnapshot {
+              public static final int MAIN_INVENTORY_SIZE = 36;
+              public static final int HOTBAR_SIZE = 9;
+              public static final int OFFHAND_HANDLER_SLOT = 45;
+
+              private final SlotState[] mainSlots;
+              private final SlotState offhandSlot;
+              private final boolean cursorEmpty;
+              private final int selectedHotbarSlot;
+
+              public InventorySnapshot(SlotState[] mainSlots, SlotState offhandSlot, boolean cursorEmpty, int selectedHotbarSlot) {
+                  if (mainSlots == null || mainSlots.length != MAIN_INVENTORY_SIZE) {
+                      throw new IllegalArgumentException("mainSlots must have exactly 36 elements");
+                  }
+                  this.mainSlots = Arrays.copyOf(mainSlots, MAIN_INVENTORY_SIZE);
+                  for (int i = 0; i < MAIN_INVENTORY_SIZE; i++) {
+                      if (this.mainSlots[i] == null) {
+                          this.mainSlots[i] = SlotState.EMPTY;
+                      }
+                  }
+                  this.offhandSlot = Objects.requireNonNullElse(offhandSlot, SlotState.EMPTY);
+                  this.cursorEmpty = cursorEmpty;
+                  this.selectedHotbarSlot = Math.max(0, Math.min(8, selectedHotbarSlot));
+              }
+
+              public SlotState getMainSlot(int index) {
+                  return mainSlots[index];
+              }
+
+              public SlotState getOffhandSlot() {
+                  return offhandSlot;
+              }
+
+              public boolean isCursorEmpty() {
+                  return cursorEmpty;
+              }
+
+              public int getSelectedHotbarSlot() {
+                  return selectedHotbarSlot;
+              }
+          }
+          """)
+
+          write_file("src/main/java/dev/totemsnap/logic/SwapPlan.java", """
+          package dev.totemsnap.logic;
+
+          import java.util.List;
+
+          public record SwapPlan(
+                  Outcome outcome,
+                  int sourceInventorySlot,
+                  int sourceHandlerSlot,
+                  List<ClickStep> steps
+          ) {
+              public enum Outcome {
+                  DISABLED,
+                  ALREADY_IN_OFFHAND,
+                  NO_TOTEM_FOUND,
+                  UNSAFE_CURSOR_OR_NO_SPACE,
+                  EXECUTE_SWAP
+              }
+
+              public enum ActionKind {
+                  /**
+                   * Uses SlotActionType.SWAP with button = hotbarIndex (0..8) on target slot 45.
+                   * Single-packet atomic exchange between hotbar slot and offhand slot.
+                   */
+                  HOTBAR_SWAP,
+                  /**
+                   * Uses SlotActionType.PICKUP with button = 0 (left click) on the specified handler slot.
+                   */
+                  PICKUP_LEFT_CLICK
+              }
+
+              public record ClickStep(int handlerSlot, int button, ActionKind actionKind) {
+              }
+          }
+          """)
+
+          write_file("src/main/java/dev/totemsnap/logic/SwapPlanner.java", """
+          package dev.totemsnap.logic;
+
+          import java.util.List;
+
+          /**
+           * Pure, deterministic planner for one-key Totem of Undying offhand swapping.
+           * Guarantees:
+           * 1. Respects the master enable/disable toggle.
+           * 2. Never swaps if the offhand already holds a Totem of Undying.
+           * 3. Preserves any existing offhand item (e.g., Shield, blocks, food) in the source slot
+           *    where the Totem came from without overwriting or deleting any unrelated slot.
+           * 4. Refuses to execute multi-click PICKUP sequences if the cursor is currently holding an item.
+           */
+          public final class SwapPlanner {
+              private SwapPlanner() {
+              }
+
+              public static SwapPlan planSwap(InventorySnapshot snapshot, boolean modEnabled, boolean preferHotbar) {
+                  if (!modEnabled) {
+                      return new SwapPlan(SwapPlan.Outcome.DISABLED, -1, -1, List.of());
+                  }
+
+                  if (snapshot.getOffhandSlot() == SlotState.TOTEM) {
+                      return new SwapPlan(SwapPlan.Outcome.ALREADY_IN_OFFHAND, -1, -1, List.of());
+                  }
+
+                  int totemInventoryIndex = findBestTotemSlot(snapshot, preferHotbar);
+                  if (totemInventoryIndex < 0) {
+                      return new SwapPlan(SwapPlan.Outcome.NO_TOTEM_FOUND, -1, -1, List.of());
+                  }
+
+                  int handlerSlot = toScreenHandlerSlot(totemInventoryIndex);
+
+                  // Case 1: Totem is in the hotbar (inventory index 0..8).
+                  // SlotActionType.SWAP with button = hotbarIndex on slot 45 atomically swaps the
+                  // hotbar Totem and any existing offhand item (such as a Shield) in a single clickSlot call,
+                  // without touching the cursor stack.
+                  if (totemInventoryIndex >= 0 && totemInventoryIndex < InventorySnapshot.HOTBAR_SIZE) {
+                      List<SwapPlan.ClickStep> steps = List.of(
+                              new SwapPlan.ClickStep(
+                                      InventorySnapshot.OFFHAND_HANDLER_SLOT,
+                                      totemInventoryIndex,
+                                      SwapPlan.ActionKind.HOTBAR_SWAP
+                              )
+                      );
+                      return new SwapPlan(SwapPlan.Outcome.EXECUTE_SWAP, totemInventoryIndex, handlerSlot, steps);
+                  }
+
+                  // Case 2: Totem is in the main storage inventory (index 9..35).
+                  // Requires cursor to be empty so we never drop, overwrite, or mix a held cursor stack.
+                  if (!snapshot.isCursorEmpty()) {
+                      return new SwapPlan(SwapPlan.Outcome.UNSAFE_CURSOR_OR_NO_SPACE, totemInventoryIndex, handlerSlot, List.of());
+                  }
+
+                  if (snapshot.getOffhandSlot() == SlotState.EMPTY) {
+                      // Offhand is empty: Pick up Totem from main inventory, place into offhand (slot 45).
+                      List<SwapPlan.ClickStep> steps = List.of(
+                              new SwapPlan.ClickStep(handlerSlot, 0, SwapPlan.ActionKind.PICKUP_LEFT_CLICK),
+                              new SwapPlan.ClickStep(InventorySnapshot.OFFHAND_HANDLER_SLOT, 0, SwapPlan.ActionKind.PICKUP_LEFT_CLICK)
+                      );
+                      return new SwapPlan(SwapPlan.Outcome.EXECUTE_SWAP, totemInventoryIndex, handlerSlot, steps);
+                  } else {
+                      // Offhand contains a Shield or other item:
+                      // 1. Pick up Totem from source slot (source slot becomes empty)
+                      // 2. Left-click offhand slot 45 (Totem goes to offhand, displaced Shield/item is now on cursor)
+                      // 3. Left-click source slot (Displaced Shield/item is placed safely into the vacated source slot)
+                      List<SwapPlan.ClickStep> steps = List.of(
+                              new SwapPlan.ClickStep(handlerSlot, 0, SwapPlan.ActionKind.PICKUP_LEFT_CLICK),
+                              new SwapPlan.ClickStep(InventorySnapshot.OFFHAND_HANDLER_SLOT, 0, SwapPlan.ActionKind.PICKUP_LEFT_CLICK),
+                              new SwapPlan.ClickStep(handlerSlot, 0, SwapPlan.ActionKind.PICKUP_LEFT_CLICK)
+                      );
+                      return new SwapPlan(SwapPlan.Outcome.EXECUTE_SWAP, totemInventoryIndex, handlerSlot, steps);
+                  }
+              }
+
+              public static int findBestTotemSlot(InventorySnapshot snapshot, boolean preferHotbar) {
+                  if (preferHotbar) {
+                      // Check non-selected hotbar slots first so we avoid replacing the player's currently held mainhand weapon if another hotbar totem exists
+                      for (int i = 0; i < InventorySnapshot.HOTBAR_SIZE; i++) {
+                          if (i != snapshot.getSelectedHotbarSlot() && snapshot.getMainSlot(i) == SlotState.TOTEM) {
+                              return i;
+                          }
+                      }
+                      if (snapshot.getMainSlot(snapshot.getSelectedHotbarSlot()) == SlotState.TOTEM) {
+                          return snapshot.getSelectedHotbarSlot();
+                      }
+                      for (int i = InventorySnapshot.HOTBAR_SIZE; i < InventorySnapshot.MAIN_INVENTORY_SIZE; i++) {
+                          if (snapshot.getMainSlot(i) == SlotState.TOTEM) {
+                              return i;
+                          }
+                      }
+                  } else {
+                      for (int i = InventorySnapshot.HOTBAR_SIZE; i < InventorySnapshot.MAIN_INVENTORY_SIZE; i++) {
+                          if (snapshot.getMainSlot(i) == SlotState.TOTEM) {
+                              return i;
+                          }
+                      }
+                      for (int i = 0; i < InventorySnapshot.HOTBAR_SIZE; i++) {
+                          if (i != snapshot.getSelectedHotbarSlot() && snapshot.getMainSlot(i) == SlotState.TOTEM) {
+                              return i;
+                          }
+                      }
+                      if (snapshot.getMainSlot(snapshot.getSelectedHotbarSlot()) == SlotState.TOTEM) {
+                          return snapshot.getSelectedHotbarSlot();
+                      }
+                  }
+                  return -1;
+              }
+
+              /**
+               * Converts PlayerInventory main index (0..35) to PlayerScreenHandler slot index (9..44).
+               */
+              public static int toScreenHandlerSlot(int mainInventoryIndex) {
+                  if (mainInventoryIndex < 0 || mainInventoryIndex >= InventorySnapshot.MAIN_INVENTORY_SIZE) {
+                      throw new IllegalArgumentException("Invalid mainInventoryIndex: " + mainInventoryIndex);
+                  }
+                  return mainInventoryIndex < InventorySnapshot.HOTBAR_SIZE
+                          ? mainInventoryIndex + 36
+                          : mainInventoryIndex;
+              }
+          }
+          """)
+
+          write_file("src/main/java/dev/totemsnap/client/TotemSnapClient.java", """
+          package dev.totemsnap.client;
+
+          import dev.totemsnap.TotemSnapMod;
+          import dev.totemsnap.config.TotemSnapConfig;
+          import dev.totemsnap.config.TotemSnapConfigManager;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
+          import net.fabricmc.loader.api.FabricLoader;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.util.InputUtil;
+          import net.minecraft.util.Identifier;
+          import org.lwjgl.glfw.GLFW;
+
+          import java.nio.file.Path;
+
+          public final class TotemSnapClient implements ClientModInitializer {
+              private static TotemSnapClient instance;
+
+              public static final KeyBinding.Category KEY_CATEGORY =
+                      KeyBinding.Category.create(Identifier.of(TotemSnapMod.MOD_ID, "general"));
+
+              private TotemSnapConfigManager configManager;
+              private KeyBinding activateKeyBinding;
+              private TotemSwapController swapController;
+              private boolean wasKeyDownLastTick = false;
+
+              @Override
+              public void onInitializeClient() {
+                  instance = this;
+
+                  Path configFile = FabricLoader.getInstance().getConfigDir().resolve("totemsnap.json");
+                  this.configManager = new TotemSnapConfigManager(configFile);
+                  TotemSnapConfig config = this.configManager.load();
+
+                  this.activateKeyBinding = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                          "key.totemsnap.activate",
+                          InputUtil.Type.KEYSYM,
+                          GLFW.GLFW_KEY_R,
+                          KEY_CATEGORY
+                  ));
+
+                  applyConfiguredKeyToBinding(config);
+
+                  this.swapController = new TotemSwapController(this.configManager);
+
+                  ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
+                      this.wasKeyDownLastTick = false;
+                      this.swapController.resetState();
+                  });
+
+                  ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
+                      this.wasKeyDownLastTick = false;
+                      this.swapController.resetState();
+                  });
+
+                  ClientTickEvents.END_CLIENT_TICK.register(this::onEndClientTick);
+              }
+
+              private void onEndClientTick(MinecraftClient client) {
+                  if (this.swapController == null || this.configManager == null) {
+                      return;
+                  }
+
+                  syncKeyBindingToConfigIfChanged(client);
+                  this.swapController.onClientTick(client);
+
+                  // Consume all queued presses so holding or pressing once triggers at most one swap per physical press
+                  boolean pressedEvent = false;
+                  while (this.activateKeyBinding.wasPressed()) {
+                      pressedEvent = true;
+                  }
+
+                  boolean currentlyDown = this.activateKeyBinding.isPressed();
+                  if (pressedEvent && !this.wasKeyDownLastTick) {
+                      // Only activate during normal gameplay when no GUI screen is open
+                      if (client.currentScreen == null) {
+                          this.swapController.tryActivateOnce(client);
+                      }
+                  }
+                  this.wasKeyDownLastTick = currentlyDown;
+              }
+
+              public void applyConfiguredKeyToBinding(TotemSnapConfig config) {
+                  if (this.activateKeyBinding == null || config == null) {
+                      return;
+                  }
+                  try {
+                      InputUtil.Key key = InputUtil.fromTranslationKey(config.getBoundKeyTranslationKey());
+                      this.activateKeyBinding.setBoundKey(key);
+                      KeyBinding.updateKeysByCode();
+                  } catch (Exception ex) {
+                      TotemSnapMod.LOGGER.warn("Fallback to default key R due to invalid translation key: {}", config.getBoundKeyTranslationKey());
+                      this.activateKeyBinding.setBoundKey(InputUtil.Type.KEYSYM.createFromCode(GLFW.GLFW_KEY_R));
+                      KeyBinding.updateKeysByCode();
+                  }
+              }
+
+              private void syncKeyBindingToConfigIfChanged(MinecraftClient client) {
+                  if (this.activateKeyBinding == null || this.configManager == null) {
+                      return;
+                  }
+                  String currentTranslationKey = this.activateKeyBinding.getBoundKeyTranslationKey();
+                  TotemSnapConfig cfg = this.configManager.getConfig();
+                  if (currentTranslationKey != null && !currentTranslationKey.equals(cfg.getBoundKeyTranslationKey())) {
+                      cfg.setBoundKeyTranslationKey(currentTranslationKey);
+                      this.configManager.save();
+                      if (client != null && client.options != null) {
+                          client.options.write();
+                      }
+                  }
+              }
+
+              public static TotemSnapClient getInstance() {
+                  return instance;
+              }
+
+              public TotemSnapConfigManager getConfigManager() {
+                  return configManager;
+              }
+
+              public KeyBinding getActivateKeyBinding() {
+                  return activateKeyBinding;
+              }
+
+              public TotemSwapController getSwapController() {
+                  return swapController;
+              }
+          }
+          """)
+
+          write_file("src/main/java/dev/totemsnap/client/TotemSwapController.java", """
+          package dev.totemsnap.client;
+
+          import dev.totemsnap.TotemSnapMod;
+          import dev.totemsnap.config.TotemSnapConfig;
+          import dev.totemsnap.config.TotemSnapConfigManager;
+          import dev.totemsnap.logic.InventorySnapshot;
+          import dev.totemsnap.logic.SlotState;
+          import dev.totemsnap.logic.SwapPlan;
+          import dev.totemsnap.logic.SwapPlanner;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.network.ClientPlayerEntity;
+          import net.minecraft.client.network.ClientPlayerInteractionManager;
+          import net.minecraft.entity.player.PlayerInventory;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.item.Items;
+          import net.minecraft.screen.PlayerScreenHandler;
+          import net.minecraft.screen.slot.SlotActionType;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.Formatting;
+
+          /**
+           * Handles legitimate client-to-server offhand Totem swaps using ClientPlayerInteractionManager#clickSlot.
+           * Never opens an inventory GUI, never fabricates packets, and reconciles state across ticks.
+           */
+          public final class TotemSwapController {
+              private static final int VERIFICATION_TIMEOUT_TICKS = 12;
+
+              private final TotemSnapConfigManager configManager;
+              private boolean awaitingServerVerification = false;
+              private int verificationTicksRemaining = 0;
+
+              public TotemSwapController(TotemSnapConfigManager configManager) {
+                  this.configManager = configManager;
+              }
+
+              public void resetState() {
+                  this.awaitingServerVerification = false;
+                  this.verificationTicksRemaining = 0;
+              }
+
+              public void onClientTick(MinecraftClient client) {
+                  TotemSnapConfig config = this.configManager.getConfig();
+                  if (!config.isEnabled()) {
+                      resetState();
+                      return;
+                  }
+
+                  ClientPlayerEntity player = client.player;
+                  if (player == null || player.isDead() || player.isRemoved() || client.world == null || client.getNetworkHandler() == null) {
+                      resetState();
+                      return;
+                  }
+
+                  if (player.currentScreenHandler != player.playerScreenHandler) {
+                      resetState();
+                      return;
+                  }
+
+                  if (this.awaitingServerVerification) {
+                      if (player.getOffHandStack().isOf(Items.TOTEM_OF_UNDYING)) {
+                          // Swap confirmed in offhand; ensure cursor holds nothing left over
+                          this.awaitingServerVerification = false;
+                          this.verificationTicksRemaining = 0;
+                          if (config.isShowOperationStatusMessages()) {
+                              sendHudMessage(player, Text.translatable("message.totemsnap.swapped").formatted(Formatting.AQUA));
+                          }
+                      } else {
+                          this.verificationTicksRemaining--;
+                          if (this.verificationTicksRemaining <= 0) {
+                              this.awaitingServerVerification = false;
+                              reconcileCursorIfNeeded(client, player);
+                              if (config.isShowOperationStatusMessages()) {
+                                  sendHudMessage(player, Text.translatable("message.totemsnap.rejected").formatted(Formatting.RED));
+                              }
+                          }
+                      }
+                  }
+              }
+
+              public void tryActivateOnce(MinecraftClient client) {
+                  TotemSnapConfig config = this.configManager.getConfig();
+                  if (!config.isEnabled()) {
+                      resetState();
+                      return;
+                  }
+
+                  ClientPlayerEntity player = client.player;
+                  ClientPlayerInteractionManager interactionManager = client.interactionManager;
+                  if (player == null || interactionManager == null || client.world == null || client.getNetworkHandler() == null) {
+                      resetState();
+                      return;
+                  }
+
+                  if (player.isDead() || player.isSpectator()) {
+                      resetState();
+                      return;
+                  }
+
+                  // Requirement 6: Never open inventory GUI; only act when playerScreenHandler is active and no screen is open
+                  if (client.currentScreen != null || player.currentScreenHandler != player.playerScreenHandler) {
+                      return;
+                  }
+
+                  // Avoid overlapping swaps while waiting for server verification
+                  if (this.awaitingServerVerification) {
+                      return;
+                  }
+
+                  InventorySnapshot snapshot = captureSnapshot(player);
+                  SwapPlan plan = SwapPlanner.planSwap(snapshot, config.isEnabled(), config.isPreferHotbarTotem());
+
+                  switch (plan.outcome()) {
+                      case DISABLED -> resetState();
+                      case ALREADY_IN_OFFHAND -> {
+                          if (config.isShowOperationStatusMessages()) {
+                              sendHudMessage(player, Text.translatable("message.totemsnap.already_equipped").formatted(Formatting.GRAY));
+                          }
+                      }
+                      case NO_TOTEM_FOUND -> {
+                          if (config.isShowMissingTotemMessage()) {
+                              sendHudMessage(player, Text.translatable("message.totemsnap.no_totem").formatted(Formatting.RED));
+                          }
+                      }
+                      case UNSAFE_CURSOR_OR_NO_SPACE -> {
+                          if (config.isShowOperationStatusMessages()) {
+                              sendHudMessage(player, Text.translatable("message.totemsnap.no_space").formatted(Formatting.GOLD));
+                          }
+                      }
+                      case EXECUTE_SWAP -> executeSwapPlan(interactionManager, player, plan);
+                  }
+              }
+
+              private void executeSwapPlan(
+                      ClientPlayerInteractionManager interactionManager,
+                      ClientPlayerEntity player,
+                      SwapPlan plan
+              ) {
+                  PlayerScreenHandler handler = player.playerScreenHandler;
+                  int syncId = handler.syncId;
+
+                  try {
+                      for (SwapPlan.ClickStep step : plan.steps()) {
+                          SlotActionType actionType = step.actionKind() == SwapPlan.ActionKind.HOTBAR_SWAP
+                                  ? SlotActionType.SWAP
+                                  : SlotActionType.PICKUP;
+                          interactionManager.clickSlot(syncId, step.handlerSlot(), step.button(), actionType, player);
+                      }
+
+                      // Reconcile if cursor unexpectedly retained an item due to immediate local rejection
+                      reconcileCursorIfNeeded(MinecraftClient.getInstance(), player);
+
+                      this.awaitingServerVerification = true;
+                      this.verificationTicksRemaining = VERIFICATION_TIMEOUT_TICKS;
+                  } catch (Exception ex) {
+                      TotemSnapMod.LOGGER.warn("TotemSnap swap interaction failed safely", ex);
+                      resetState();
+                  }
+              }
+
+              private void reconcileCursorIfNeeded(MinecraftClient client, ClientPlayerEntity player) {
+                  if (client == null || client.interactionManager == null || player == null) {
+                      return;
+                  }
+                  PlayerScreenHandler handler = player.playerScreenHandler;
+                  if (handler.getCursorStack().isEmpty()) {
+                      return;
+                  }
+                  // Find an empty slot in the player's main/hotbar handler slots (9..44) to safely return any stranded cursor stack
+                  for (int slotId = 9; slotId <= 44; slotId++) {
+                      if (handler.getSlot(slotId).getStack().isEmpty()) {
+                          client.interactionManager.clickSlot(handler.syncId, slotId, 0, SlotActionType.PICKUP, player);
+                          break;
+                      }
+                  }
+              }
+
+              private static InventorySnapshot captureSnapshot(ClientPlayerEntity player) {
+                  PlayerInventory inv = player.getInventory();
+                  SlotState[] mainStates = new SlotState[InventorySnapshot.MAIN_INVENTORY_SIZE];
+                  for (int i = 0; i < InventorySnapshot.MAIN_INVENTORY_SIZE; i++) {
+                      mainStates[i] = classifyStack(inv.getStack(i));
+                  }
+                  SlotState offhandState = classifyStack(player.getOffHandStack());
+                  boolean cursorEmpty = player.playerScreenHandler.getCursorStack().isEmpty();
+                  int selectedSlot = 0;
+                  for (int i = 0; i < InventorySnapshot.HOTBAR_SIZE; i++) {
+                      if (ItemStack.areEqual(inv.getStack(i), player.getMainHandStack())) {
+                          selectedSlot = i;
+                          break;
+                      }
+                  }
+                  return new InventorySnapshot(mainStates, offhandState, cursorEmpty, selectedSlot);
+              }
+
+              private static SlotState classifyStack(ItemStack stack) {
+                  if (stack == null || stack.isEmpty()) {
+                      return SlotState.EMPTY;
+                  }
+                  if (stack.isOf(Items.TOTEM_OF_UNDYING)) {
+                      return SlotState.TOTEM;
+                  }
+                  return SlotState.OTHER;
+              }
+
+              private static void sendHudMessage(ClientPlayerEntity player, Text message) {
+                  player.sendMessage(message, true);
+              }
+          }
+          """)
+
+          write_file("src/main/java/dev/totemsnap/client/gui/TotemSnapConfigScreen.java", """
+          package dev.totemsnap.client.gui;
+
+          import dev.totemsnap.client.TotemSnapClient;
+          import dev.totemsnap.config.TotemSnapConfig;
+          import dev.totemsnap.config.TotemSnapConfigManager;
+          import net.minecraft.client.gui.Click;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.client.input.KeyInput;
+          import net.minecraft.client.util.InputUtil;
+          import net.minecraft.screen.ScreenTexts;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.Formatting;
+          import org.lwjgl.glfw.GLFW;
+
+          public final class TotemSnapConfigScreen extends Screen {
+              // Dark slate interface with restrained cyan accents
+              private static final int COLOR_BG_TOP = 0xF00D1117;
+              private static final int COLOR_BG_BOTTOM = 0xF0161B22;
+              private static final int COLOR_PANEL_FILL = 0xCC111822;
+              private static final int COLOR_CYAN_ACCENT = 0xFF00D4FF;
+              private static final int COLOR_CYAN_MUTED = 0xFF1F6E8C;
+              private static final int COLOR_TEXT_PRIMARY = 0xFFE6EDF3;
+              private static final int COLOR_TEXT_SECONDARY = 0xFF8B949E;
+
+              private final Screen parent;
+              private final TotemSnapConfigManager configManager;
+              private final TotemSnapConfig workingCopy;
+
+              private boolean listeningForKey = false;
+
+              private ButtonWidget masterToggleButton;
+              private ButtonWidget keybindButton;
+              private ButtonWidget missingMessageButton;
+              private ButtonWidget statusMessageButton;
+              private ButtonWidget preferHotbarButton;
+
+              public TotemSnapConfigScreen(Screen parent) {
+                  super(Text.translatable("screen.totemsnap.config.title"));
+                  this.parent = parent;
+                  this.configManager = TotemSnapClient.getInstance().getConfigManager();
+                  this.workingCopy = this.configManager.getConfig().copy();
+              }
+
+              @Override
+              protected void init() {
+                  int panelWidth = 260;
+                  int buttonWidth = 236;
+                  int buttonHeight = 20;
+                  int centerX = this.width / 2;
+                  int startY = Math.max(52, (this.height - 210) / 2);
+
+                  this.masterToggleButton = ButtonWidget.builder(getMasterToggleText(), btn -> {
+                      this.workingCopy.setEnabled(!this.workingCopy.isEnabled());
+                      this.listeningForKey = false;
+                      refreshButtonLabels();
+                  }).dimensions(centerX - buttonWidth / 2, startY, buttonWidth, buttonHeight).build();
+
+                  this.keybindButton = ButtonWidget.builder(getKeybindButtonText(), btn -> {
+                      this.listeningForKey = !this.listeningForKey;
+                      refreshButtonLabels();
+                  }).dimensions(centerX - buttonWidth / 2, startY + 26, buttonWidth, buttonHeight).build();
+
+                  this.missingMessageButton = ButtonWidget.builder(getMissingMessageText(), btn -> {
+                      this.workingCopy.setShowMissingTotemMessage(!this.workingCopy.isShowMissingTotemMessage());
+                      this.listeningForKey = false;
+                      refreshButtonLabels();
+                  }).dimensions(centerX - buttonWidth / 2, startY + 52, buttonWidth, buttonHeight).build();
+
+                  this.statusMessageButton = ButtonWidget.builder(getStatusMessageText(), btn -> {
+                      this.workingCopy.setShowOperationStatusMessages(!this.workingCopy.isShowOperationStatusMessages());
+                      this.listeningForKey = false;
+                      refreshButtonLabels();
+                  }).dimensions(centerX - buttonWidth / 2, startY + 78, buttonWidth, buttonHeight).build();
+
+                  this.preferHotbarButton = ButtonWidget.builder(getPreferHotbarText(), btn -> {
+                      this.workingCopy.setPreferHotbarTotem(!this.workingCopy.isPreferHotbarTotem());
+                      this.listeningForKey = false;
+                      refreshButtonLabels();
+                  }).dimensions(centerX - buttonWidth / 2, startY + 104, buttonWidth, buttonHeight).build();
+
+                  ButtonWidget restoreDefaultsButton = ButtonWidget.builder(
+                          Text.translatable("button.totemsnap.restore_defaults"),
+                          btn -> {
+                              this.workingCopy.restoreDefaults();
+                              this.listeningForKey = false;
+                              refreshButtonLabels();
+                          }
+                  ).dimensions(centerX - buttonWidth / 2, startY + 134, buttonWidth, buttonHeight).build();
+
+                  int halfWidth = (buttonWidth - 8) / 2;
+                  ButtonWidget saveButton = ButtonWidget.builder(
+                          Text.translatable("button.totemsnap.save").formatted(Formatting.AQUA),
+                          btn -> saveAndClose()
+                  ).dimensions(centerX - buttonWidth / 2, startY + 162, halfWidth, buttonHeight).build();
+
+                  ButtonWidget cancelButton = ButtonWidget.builder(
+                          ScreenTexts.CANCEL,
+                          btn -> close()
+                  ).dimensions(centerX - buttonWidth / 2 + halfWidth + 8, startY + 162, halfWidth, buttonHeight).build();
+
+                  this.addDrawableChild(this.masterToggleButton);
+                  this.addDrawableChild(this.keybindButton);
+                  this.addDrawableChild(this.missingMessageButton);
+                  this.addDrawableChild(this.statusMessageButton);
+                  this.addDrawableChild(this.preferHotbarButton);
+                  this.addDrawableChild(restoreDefaultsButton);
+                  this.addDrawableChild(saveButton);
+                  this.addDrawableChild(cancelButton);
+              }
+
+              private void refreshButtonLabels() {
+                  if (this.masterToggleButton != null) {
+                      this.masterToggleButton.setMessage(getMasterToggleText());
+                  }
+                  if (this.keybindButton != null) {
+                      this.keybindButton.setMessage(getKeybindButtonText());
+                  }
+                  if (this.missingMessageButton != null) {
+                      this.missingMessageButton.setMessage(getMissingMessageText());
+                  }
+                  if (this.statusMessageButton != null) {
+                      this.statusMessageButton.setMessage(getStatusMessageText());
+                  }
+                  if (this.preferHotbarButton != null) {
+                      this.preferHotbarButton.setMessage(getPreferHotbarText());
+                  }
+              }
+
+              private Text getMasterToggleText() {
+                  Text state = this.workingCopy.isEnabled()
+                          ? Text.literal("ON").formatted(Formatting.AQUA)
+                          : Text.literal("OFF").formatted(Formatting.RED);
+                  return Text.translatable("option.totemsnap.enabled").append(Text.literal(": ")).append(state);
+              }
+
+              private Text getKeybindButtonText() {
+                  if (this.listeningForKey) {
+                      return Text.translatable("option.totemsnap.keybind")
+                              .append(Text.literal(": "))
+                              .append(Text.literal("> Press any key (ESC to cancel) <").formatted(Formatting.AQUA));
+                  }
+                  InputUtil.Key key = InputUtil.fromTranslationKey(this.workingCopy.getBoundKeyTranslationKey());
+                  return Text.translatable("option.totemsnap.keybind")
+                          .append(Text.literal(": "))
+                          .append(key.getLocalizedText().copy().formatted(Formatting.AQUA));
+              }
+
+              private Text getMissingMessageText() {
+                  Text state = this.workingCopy.isShowMissingTotemMessage()
+                          ? Text.literal("ON").formatted(Formatting.AQUA)
+                          : Text.literal("OFF").formatted(Formatting.GRAY);
+                  return Text.translatable("option.totemsnap.show_missing_message").append(Text.literal(": ")).append(state);
+              }
+
+              private Text getStatusMessageText() {
+                  Text state = this.workingCopy.isShowOperationStatusMessages()
+                          ? Text.literal("ON").formatted(Formatting.AQUA)
+                          : Text.literal("OFF").formatted(Formatting.GRAY);
+                  return Text.translatable("option.totemsnap.show_status_messages").append(Text.literal(": ")).append(state);
+              }
+
+              private Text getPreferHotbarText() {
+                  Text state = this.workingCopy.isPreferHotbarTotem()
+                          ? Text.literal("Hotbar First").formatted(Formatting.AQUA)
+                          : Text.literal("Inventory First").formatted(Formatting.GRAY);
+                  return Text.translatable("option.totemsnap.prefer_hotbar").append(Text.literal(": ")).append(state);
+              }
+
+              @Override
+              public boolean keyPressed(KeyInput input) {
+                  if (this.listeningForKey) {
+                      int keyCode = input.key();
+                      int scanCode = input.scancode();
+                      if (keyCode == GLFW.GLFW_KEY_ESCAPE) {
+                          this.listeningForKey = false;
+                      } else {
+                          InputUtil.Key newKey = InputUtil.fromKeyCode(keyCode, scanCode);
+                          this.workingCopy.setBoundKeyTranslationKey(newKey.getTranslationKey());
+                          this.listeningForKey = false;
+                      }
+                      refreshButtonLabels();
+                      return true;
+                  }
+                  return super.keyPressed(input);
+              }
+
+              @Override
+              public boolean mouseClicked(Click click, boolean doubled) {
+                  if (this.listeningForKey) {
+                      int button = click.button();
+                      if (button >= 0) {
+                          InputUtil.Key mouseKey = InputUtil.Type.MOUSE.createFromCode(button);
+                          this.workingCopy.setBoundKeyTranslationKey(mouseKey.getTranslationKey());
+                          this.listeningForKey = false;
+                          refreshButtonLabels();
+                          return true;
+                      }
+                  }
+                  return super.mouseClicked(click, doubled);
+              }
+
+              private void saveAndClose() {
+                  this.configManager.updateAndSave(this.workingCopy);
+                  TotemSnapClient clientMod = TotemSnapClient.getInstance();
+                  if (clientMod != null) {
+                      clientMod.applyConfiguredKeyToBinding(this.configManager.getConfig());
+                      if (!this.configManager.getConfig().isEnabled() && clientMod.getSwapController() != null) {
+                          clientMod.getSwapController().resetState();
+                      }
+                  }
+                  if (this.client != null && this.client.options != null) {
+                      this.client.options.write();
+                  }
+                  close();
+              }
+
+              @Override
+              public void close() {
+                  if (this.client != null) {
+                      this.client.setScreen(this.parent);
+                  }
+              }
+
+              @Override
+              public void render(DrawContext context, int mouseX, int mouseY, float deltaTicks) {
+                  context.fillGradient(0, 0, this.width, this.height, COLOR_BG_TOP, COLOR_BG_BOTTOM);
+
+                  int panelWidth = 264;
+                  int panelHeight = 228;
+                  int panelX = (this.width - panelWidth) / 2;
+                  int panelY = Math.max(16, (this.height - 210) / 2 - 36);
+
+                  // Dark slate card with restrained cyan border accents
+                  context.fill(panelX, panelY, panelX + panelWidth, panelY + panelHeight, COLOR_PANEL_FILL);
+                  context.fill(panelX, panelY, panelX + panelWidth, panelY + 2, COLOR_CYAN_ACCENT);
+                  context.fill(panelX, panelY + panelHeight - 1, panelX + panelWidth, panelY + panelHeight, COLOR_CYAN_MUTED);
+                  context.fill(panelX, panelY, panelX + 1, panelY + panelHeight, COLOR_CYAN_MUTED);
+                  context.fill(panelX + panelWidth - 1, panelY, panelX + panelWidth, panelY + panelHeight, COLOR_CYAN_MUTED);
+
+                  context.drawCenteredTextWithShadow(
+                          this.textRenderer,
+                          this.title,
+                          this.width / 2,
+                          panelY + 10,
+                          COLOR_TEXT_PRIMARY
+                  );
+
+                  context.drawCenteredTextWithShadow(
+                          this.textRenderer,
+                          Text.translatable("screen.totemsnap.config.subtitle"),
+                          this.width / 2,
+                          panelY + 22,
+                          COLOR_TEXT_SECONDARY
+                  );
+
+                  super.render(context, mouseX, mouseY, deltaTicks);
+              }
+          }
+          """)
+
+          write_file("src/main/java/dev/totemsnap/compat/ModMenuIntegration.java", """
+          package dev.totemsnap.compat;
+
+          import com.terraformersmc.modmenu.api.ConfigScreenFactory;
+          import com.terraformersmc.modmenu.api.ModMenuApi;
+          import dev.totemsnap.client.gui.TotemSnapConfigScreen;
+
+          public final class ModMenuIntegration implements ModMenuApi {
+              @Override
+              public ConfigScreenFactory<?> getModConfigScreenFactory() {
+                  return TotemSnapConfigScreen::new;
+              }
+          }
+          """)
+
+          write_file("src/test/java/dev/totemsnap/TotemSnapTest.java", """
+          package dev.totemsnap;
+
+          import dev.totemsnap.config.TotemSnapConfig;
+          import dev.totemsnap.config.TotemSnapConfigManager;
+          import dev.totemsnap.logic.InventorySnapshot;
+          import dev.totemsnap.logic.SlotState;
+          import dev.totemsnap.logic.SwapPlan;
+          import dev.totemsnap.logic.SwapPlanner;
+          import org.junit.jupiter.api.Test;
+          import org.junit.jupiter.api.io.TempDir;
+
+          import java.io.IOException;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.Arrays;
+
+          import static org.junit.jupiter.api.Assertions.*;
+
+          class TotemSnapTest {
+
+              @Test
+              void testMasterDisablePreventsAnySwap() {
+                  SlotState[] slots = new SlotState[36];
+                  Arrays.fill(slots, SlotState.EMPTY);
+                  slots[2] = SlotState.TOTEM;
+
+                  InventorySnapshot snapshot = new InventorySnapshot(slots, SlotState.EMPTY, true, 0);
+                  SwapPlan plan = SwapPlanner.planSwap(snapshot, false, true);
+
+                  assertEquals(SwapPlan.Outcome.DISABLED, plan.outcome());
+                  assertTrue(plan.steps().isEmpty());
+              }
+
+              @Test
+              void testAlreadyEquippedTotemDoesNotSwap() {
+                  SlotState[] slots = new SlotState[36];
+                  Arrays.fill(slots, SlotState.EMPTY);
+                  slots[4] = SlotState.TOTEM;
+
+                  InventorySnapshot snapshot = new InventorySnapshot(slots, SlotState.TOTEM, true, 0);
+                  SwapPlan plan = SwapPlanner.planSwap(snapshot, true, true);
+
+                  assertEquals(SwapPlan.Outcome.ALREADY_IN_OFFHAND, plan.outcome());
+                  assertTrue(plan.steps().isEmpty());
+              }
+
+              @Test
+              void testMissingTotemReportsNoTotemFound() {
+                  SlotState[] slots = new SlotState[36];
+                  Arrays.fill(slots, SlotState.OTHER);
+
+                  InventorySnapshot snapshot = new InventorySnapshot(slots, SlotState.OTHER, true, 0);
+                  SwapPlan plan = SwapPlanner.planSwap(snapshot, true, true);
+
+                  assertEquals(SwapPlan.Outcome.NO_TOTEM_FOUND, plan.outcome());
+                  assertTrue(plan.steps().isEmpty());
+              }
+
+              @Test
+              void testHotbarTotemUsesAtomicSwapAndPreservesShieldInOffhand() {
+                  SlotState[] slots = new SlotState[36];
+                  Arrays.fill(slots, SlotState.OTHER);
+                  slots[5] = SlotState.TOTEM;
+
+                  // Offhand currently holds a Shield (SlotState.OTHER)
+                  InventorySnapshot snapshot = new InventorySnapshot(slots, SlotState.OTHER, true, 0);
+                  SwapPlan plan = SwapPlanner.planSwap(snapshot, true, true);
+
+                  assertEquals(SwapPlan.Outcome.EXECUTE_SWAP, plan.outcome());
+                  assertEquals(5, plan.sourceInventorySlot());
+                  assertEquals(41, plan.sourceHandlerSlot());
+                  assertEquals(1, plan.steps().size());
+
+                  SwapPlan.ClickStep step = plan.steps().get(0);
+                  assertEquals(InventorySnapshot.OFFHAND_HANDLER_SLOT, step.handlerSlot());
+                  assertEquals(5, step.button());
+                  assertEquals(SwapPlan.ActionKind.HOTBAR_SWAP, step.actionKind());
+              }
+
+              @Test
+              void testMainInventoryTotemPreservesOffhandShieldWithThreeStepPickup() {
+                  SlotState[] slots = new SlotState[36];
+                  Arrays.fill(slots, SlotState.OTHER);
+                  slots[14] = SlotState.TOTEM;
+
+                  // Offhand holds a Shield (SlotState.OTHER), full inventory everywhere else
+                  InventorySnapshot snapshot = new InventorySnapshot(slots, SlotState.OTHER, true, 0);
+                  SwapPlan plan = SwapPlanner.planSwap(snapshot, true, true);
+
+                  assertEquals(SwapPlan.Outcome.EXECUTE_SWAP, plan.outcome());
+                  assertEquals(14, plan.sourceInventorySlot());
+                  assertEquals(14, plan.sourceHandlerSlot());
+                  assertEquals(3, plan.steps().size());
+
+                  assertEquals(new SwapPlan.ClickStep(14, 0, SwapPlan.ActionKind.PICKUP_LEFT_CLICK), plan.steps().get(0));
+                  assertEquals(new SwapPlan.ClickStep(45, 0, SwapPlan.ActionKind.PICKUP_LEFT_CLICK), plan.steps().get(1));
+                  assertEquals(new SwapPlan.ClickStep(14, 0, SwapPlan.ActionKind.PICKUP_LEFT_CLICK), plan.steps().get(2));
+              }
+
+              @Test
+              void testUnsafeCursorCancelsMainInventorySwap() {
+                  SlotState[] slots = new SlotState[36];
+                  Arrays.fill(slots, SlotState.EMPTY);
+                  slots[20] = SlotState.TOTEM;
+
+                  InventorySnapshot snapshot = new InventorySnapshot(slots, SlotState.OTHER, false, 0);
+                  SwapPlan plan = SwapPlanner.planSwap(snapshot, true, true);
+
+                  assertEquals(SwapPlan.Outcome.UNSAFE_CURSOR_OR_NO_SPACE, plan.outcome());
+                  assertTrue(plan.steps().isEmpty());
+              }
+
+              @Test
+              void testConfigPersistenceAndCorruptFileRecovery(@TempDir Path tempDir) throws IOException {
+                  Path configFile = tempDir.resolve("totemsnap.json");
+                  TotemSnapConfigManager manager = new TotemSnapConfigManager(configFile);
+
+                  TotemSnapConfig initial = manager.load();
+                  assertTrue(initial.isEnabled());
+                  assertTrue(initial.isShowMissingTotemMessage());
+                  assertEquals("key.keyboard.r", initial.getBoundKeyTranslationKey());
+
+                  initial.setEnabled(false);
+                  initial.setShowMissingTotemMessage(false);
+                  initial.setBoundKeyTranslationKey("key.keyboard.v");
+                  manager.updateAndSave(initial);
+
+                  TotemSnapConfigManager reloadedManager = new TotemSnapConfigManager(configFile);
+                  TotemSnapConfig reloaded = reloadedManager.load();
+                  assertFalse(reloaded.isEnabled());
+                  assertFalse(reloaded.isShowMissingTotemMessage());
+                  assertEquals("key.keyboard.v", reloaded.getBoundKeyTranslationKey());
+
+                  // Write corrupted JSON and verify safe default recovery
+                  Files.writeString(configFile, "{ invalid_json: [1, 2", StandardCharsets.UTF_8);
+                  TotemSnapConfig recovered = reloadedManager.load();
+                  assertTrue(recovered.isEnabled());
+                  assertTrue(recovered.isShowMissingTotemMessage());
+                  assertEquals("key.keyboard.r", recovered.getBoundKeyTranslationKey());
+              }
+          }
+          """)
+
+          write_file("LICENSE", """
+          MIT License
+
+          Copyright (c) 2026 TotemSnap Contributors
+
+          Permission is hereby granted, free of charge, to any person obtaining a copy
+          of this software and associated documentation files (the "Software"), to deal
+          in the Software without restriction, including without limitation the rights
+          to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+          copies of the Software, and to permit persons to whom the Software is
+          furnished to do so, subject to the following conditions:
+
+          The above copyright notice and this permission notice shall be included in all
+          copies or substantial portions of the Software.
+
+          THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+          IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+          FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+          AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+          LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+          OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+          SOFTWARE.
+          """)
+
+          write_file("README.md", f"""
+          # TotemSnap (Minecraft Java 1.21.11 • Fabric)
+
+          **TotemSnap** is a lightweight, responsive client-side Fabric utility mod for **Minecraft Java Edition {mc_ver}** that moves a **Totem of Undying** into your offhand with a single key press—without opening the inventory GUI and while safely preserving any existing offhand item (such as a Shield).
+
+          ## Key Features
+          - **One-Key AutoTotem (`TotemSnap Activate`):** Press your configured key once to move a Totem of Undying from your hotbar or main inventory into your offhand (`slot 45`).
+          - **Zero Inventory GUI Opening:** Uses standard `ClientPlayerInteractionManager#clickSlot` transactions on `playerScreenHandler` without ever calling `setScreen`.
+          - **Safe Offhand Preservation:** If you are holding a Shield or another item in your offhand, TotemSnap places it into the vacated Totem slot rather than overwriting or dropping items.
+          - **Master Enable/Disable Toggle (`TotemSnap Enabled`):** Instantly enable or disable the mod from Mod Menu; disabling immediately clears any pending verification state.
+          - **Configurable Missing Totem Alert:** Optionally displays `TotemSnap: No Totem found!` on the action bar when activated with no Totems in your inventory.
+          - **Mod Menu Integration:** Dark-slate configuration screen with restrained cyan accents, keybind capture, restore defaults, and JSON persistence (`config/totemsnap.json`).
+
+          ## Pinned Dependency Matrix
+          | Component | Version |
+          | :--- | :--- |
+          | Minecraft | `{mc_ver}` |
+          | Yarn Mappings | `{yarn_ver}` |
+          | Fabric Loader | `{loader_ver}` |
+          | Fabric API | `{fapi_ver}` |
+          | Mod Menu (Optional) | `{modmenu_ver}` |
+          | Java Toolchain | `JDK 21` |
+
+          ## Server Compatibility & Fair Play Notice
+          TotemSnap uses legitimate vanilla inventory slot interactions (`SlotActionType.SWAP` and `SlotActionType.PICKUP`) and respects server-authoritative inventory state. It does **not** fabricate packets, spoof acknowledgements, or implement anti-cheat bypasses. Please note that server-side plugins, custom inventory restrictions, high latency, or server rules may restrict automated slot interactions. Always check a server's rules before using inventory utility mods.
+          """)
+          PYEOF
+
+      - name: Generate Gradle Wrapper Files
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle wrapper --gradle-version "${GRADLE_VERSION}" --distribution-type bin
+          chmod +x ./gradlew
+          test -f ./gradlew
+          test -f ./gradle/wrapper/gradle-wrapper.jar
+          test -f ./gradle/wrapper/gradle-wrapper.properties
+
+      - name: Package Complete Source Project ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          zip -r dist/TotemSnap-source.zip \
+            .github \
+            gradle \
+            gradlew \
+            gradlew.bat \
+            settings.gradle \
+            build.gradle \
+            gradle.properties \
+            src \
+            README.md \
+            LICENSE \
+            .gitignore
+          test -f dist/TotemSnap-source.zip
+
+      - name: Run Unit Tests & Compile Mod with Gradle + Fabric Loom
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew clean test build --no-daemon --stacktrace
+
+      - name: Verify Built JAR & Copy to dist/TotemSnap.jar
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f build/libs/TotemSnap.jar
+          cp build/libs/TotemSnap.jar dist/TotemSnap.jar
+          jar tf dist/TotemSnap.jar | grep -q "fabric.mod.json"
+          jar tf dist/TotemSnap.jar | grep -q "dev/totemsnap/client/TotemSnapClient.class"
+          echo "Verified TotemSnap.jar structure and metadata successfully."
+
+      - name: Upload Compiled Mod JAR Artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: TotemSnap-jar
+          path: dist/TotemSnap.jar
+          if-no-files-found: error
+
+      - name: Upload Complete Generated Source ZIP Artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: TotemSnap-source-zip
+          path: dist/TotemSnap-source.zip
+          if-no-files-found: error
+
+      - name: Write GitHub Actions Build Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## TotemSnap Build Summary"
+            echo ""
+            echo "| Property | Value |"
+            echo "| :--- | :--- |"
+            echo "| **Mod Name** | \`${MOD_NAME}\` (\`${MOD_ID}\`) |"
+            echo "| **Minecraft Version** | \`${MINECRAFT_VERSION}\` |"
+            echo "| **Yarn Mappings** | \`${{ steps.resolve_deps.outputs.yarn_mappings }}\` |"
+            echo "| **Fabric Loader** | \`${{ steps.resolve_deps.outputs.loader_version }}\` |"
+            echo "| **Fabric API** | \`${{ steps.resolve_deps.outputs.fabric_api_version }}\` |"
+            echo "| **Mod Menu** | \`${{ steps.resolve_deps.outputs.modmenu_version }}\` |"
+            echo "| **Gradle / Java** | \`Gradle ${GRADLE_VERSION}\` / \`Temurin JDK 21\` |"
+            echo "| **Compiled Artifact** | \`TotemSnap.jar\` |"
+            echo "| **Source Archive** | \`TotemSnap-source.zip\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
