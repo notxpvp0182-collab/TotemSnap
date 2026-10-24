@@ -1368,7 +1368,7 @@ jobs:
                       if (keyCode == GLFW.GLFW_KEY_ESCAPE) {
                           this.listeningForKey = false;
                       } else {
-                          InputUtil.Key newKey = InputUtil.fromKeyCode(keyCode, scanCode);
+                          InputUtil.Key newKey = InputUtil.fromKeyCode(input);
                           this.workingCopy.setBoundKeyTranslationKey(newKey.getTranslationKey());
                           this.listeningForKey = false;
                       }
