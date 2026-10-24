@@ -379,9 +379,11 @@ jobs:
 
           public final class TotemSnapConfig {
               public static final String DEFAULT_KEY_TRANSLATION = "key.keyboard.r";
+              public static final String DEFAULT_MISSING_MESSAGE = "TotemSnap: No Totem found!";
 
               private boolean enabled = true;
               private boolean showMissingTotemMessage = true;
+              private String missingTotemMessage = DEFAULT_MISSING_MESSAGE;
               private boolean showOperationStatusMessages = false;
               private boolean preferHotbarTotem = true;
               private String boundKeyTranslationKey = DEFAULT_KEY_TRANSLATION;
@@ -393,6 +395,7 @@ jobs:
                   TotemSnapConfig copy = new TotemSnapConfig();
                   copy.enabled = this.enabled;
                   copy.showMissingTotemMessage = this.showMissingTotemMessage;
+                  copy.missingTotemMessage = this.missingTotemMessage;
                   copy.showOperationStatusMessages = this.showOperationStatusMessages;
                   copy.preferHotbarTotem = this.preferHotbarTotem;
                   copy.boundKeyTranslationKey = this.boundKeyTranslationKey;
@@ -403,6 +406,7 @@ jobs:
               public void restoreDefaults() {
                   this.enabled = true;
                   this.showMissingTotemMessage = true;
+                  this.missingTotemMessage = DEFAULT_MISSING_MESSAGE;
                   this.showOperationStatusMessages = false;
                   this.preferHotbarTotem = true;
                   this.boundKeyTranslationKey = DEFAULT_KEY_TRANSLATION;
@@ -423,6 +427,14 @@ jobs:
                           modified = true;
                       }
                   }
+
+                  if (this.missingTotemMessage == null || this.missingTotemMessage.trim().isEmpty()) {
+                      this.missingTotemMessage = DEFAULT_MISSING_MESSAGE;
+                      modified = true;
+                  } else if (this.missingTotemMessage.length() > 120) {
+                      this.missingTotemMessage = this.missingTotemMessage.substring(0, 120);
+                      modified = true;
+                  }
                   return modified;
               }
 
@@ -440,6 +452,15 @@ jobs:
 
               public void setShowMissingTotemMessage(boolean showMissingTotemMessage) {
                   this.showMissingTotemMessage = showMissingTotemMessage;
+              }
+
+              public String getMissingTotemMessage() {
+                  return missingTotemMessage;
+              }
+
+              public void setMissingTotemMessage(String missingTotemMessage) {
+                  this.missingTotemMessage = missingTotemMessage;
+                  sanitize();
               }
 
               public boolean isShowOperationStatusMessages() {
@@ -473,6 +494,7 @@ jobs:
                   if (!(o instanceof TotemSnapConfig that)) return false;
                   return enabled == that.enabled
                           && showMissingTotemMessage == that.showMissingTotemMessage
+                          && Objects.equals(missingTotemMessage, that.missingTotemMessage)
                           && showOperationStatusMessages == that.showOperationStatusMessages
                           && preferHotbarTotem == that.preferHotbarTotem
                           && Objects.equals(boundKeyTranslationKey, that.boundKeyTranslationKey);
@@ -480,7 +502,7 @@ jobs:
 
               @Override
               public int hashCode() {
-                  return Objects.hash(enabled, showMissingTotemMessage, showOperationStatusMessages, preferHotbarTotem, boundKeyTranslationKey);
+                  return Objects.hash(enabled, showMissingTotemMessage, missingTotemMessage, showOperationStatusMessages, preferHotbarTotem, boundKeyTranslationKey);
               }
           }
           """)
@@ -544,18 +566,19 @@ jobs:
                           dirty = true;
                       }
 
+                      if (json.has("missingTotemMessage") && json.get("missingTotemMessage").isJsonPrimitive()
+                              && json.get("missingTotemMessage").getAsJsonPrimitive().isString()) {
+                          loaded.setMissingTotemMessage(json.get("missingTotemMessage").getAsString());
+                      }
+
                       if (json.has("showOperationStatusMessages") && json.get("showOperationStatusMessages").isJsonPrimitive()
                               && json.get("showOperationStatusMessages").getAsJsonPrimitive().isBoolean()) {
                           loaded.setShowOperationStatusMessages(json.get("showOperationStatusMessages").getAsBoolean());
-                      } else {
-                          dirty = true;
                       }
 
                       if (json.has("preferHotbarTotem") && json.get("preferHotbarTotem").isJsonPrimitive()
                               && json.get("preferHotbarTotem").getAsJsonPrimitive().isBoolean()) {
                           loaded.setPreferHotbarTotem(json.get("preferHotbarTotem").getAsBoolean());
-                      } else {
-                          dirty = true;
                       }
 
                       if (json.has("boundKeyTranslationKey") && json.get("boundKeyTranslationKey").isJsonPrimitive()
@@ -1016,81 +1039,160 @@ jobs:
           import net.minecraft.text.Text;
           import net.minecraft.util.Formatting;
 
+          import java.util.ArrayList;
+          import java.util.List;
+
+          /**
+           * Paced, tick-driven state machine for legitimate Totem of Undying swaps:
+           * 1. Checks if enabled and whether a Totem is available.
+           * 2. If inventory is closed, visibly opens vanilla InventoryScreen and waits for it to render.
+           * 3. If inventory is already open, keeps it open without reopening.
+           * 4. Executes one slot click per client tick so the server processes valid sequential interactions.
+           * 5. Safely relocates any existing offhand item before/during Totem placement.
+           * 6. Verifies the Totem is in the offhand and cursor is empty, then closes the inventory screen.
+           */
           public final class TotemSwapController {
+              private enum Phase {
+                  IDLE,
+                  OPENING_SCREEN,
+                  EXECUTING_STEPS,
+                  VERIFYING_OFFHAND,
+                  CLOSING_SCREEN
+              }
+
+              private static final int SCREEN_OPEN_VISIBLE_TICKS = 2;
               private static final int VERIFICATION_TIMEOUT_TICKS = 12;
+              private static final int CLOSE_DELAY_TICKS = 1;
 
               private final TotemSnapConfigManager configManager;
-              private boolean awaitingServerVerification = false;
-              private int verificationTicksRemaining = 0;
-              private boolean openedInventoryTemporarily = false;
+              private Phase phase = Phase.IDLE;
+              private final List<SwapPlan.ClickStep> pendingSteps = new ArrayList<>();
+              private int stepIndex = 0;
+              private int ticksInPhase = 0;
 
               public TotemSwapController(TotemSnapConfigManager configManager) {
                   this.configManager = configManager;
               }
 
+              public boolean isBusy() {
+                  return this.phase != Phase.IDLE;
+              }
+
               public void resetState() {
-                  this.awaitingServerVerification = false;
-                  this.verificationTicksRemaining = 0;
-                  this.openedInventoryTemporarily = false;
+                  this.phase = Phase.IDLE;
+                  this.pendingSteps.clear();
+                  this.stepIndex = 0;
+                  this.ticksInPhase = 0;
               }
 
               public void onClientTick(MinecraftClient client) {
+                  if (this.phase == Phase.IDLE) {
+                      return;
+                  }
+
                   TotemSnapConfig config = this.configManager.getConfig();
-                  if (!config.isEnabled()) {
-                      closeTemporaryInventoryIfNeeded(client);
-                      resetState();
-                      return;
-                  }
-
                   ClientPlayerEntity player = client.player;
-                  if (player == null || player.isDead() || player.isRemoved() || client.world == null || client.getNetworkHandler() == null) {
+                  ClientPlayerInteractionManager interactionManager = client.interactionManager;
+
+                  if (!config.isEnabled()
+                          || player == null
+                          || interactionManager == null
+                          || player.isDead()
+                          || player.isRemoved()
+                          || client.world == null
+                          || client.getNetworkHandler() == null
+                          || player.currentScreenHandler != player.playerScreenHandler) {
+                      reconcileCursorIfNeeded(client, player);
                       resetState();
                       return;
                   }
 
-                  if (player.currentScreenHandler != player.playerScreenHandler) {
+                  // If the player manually closed the inventoryScreen while mid-sequence, abort cleanly
+                  if (!(client.currentScreen instanceof InventoryScreen)) {
+                      reconcileCursorIfNeeded(client, player);
                       resetState();
                       return;
                   }
 
-                  if (this.awaitingServerVerification) {
-                      if (player.getOffHandStack().isOf(Items.TOTEM_OF_UNDYING)) {
-                          reconcileCursorIfNeeded(client, player);
-                          closeTemporaryInventoryIfNeeded(client);
-                          resetState();
-                          if (config.isShowOperationStatusMessages()) {
-                              sendHudMessage(player, Text.translatable("message.totemsnap.swapped").formatted(Formatting.AQUA));
+                  switch (this.phase) {
+                      case OPENING_SCREEN -> {
+                          this.ticksInPhase++;
+                          if (this.ticksInPhase >= SCREEN_OPEN_VISIBLE_TICKS) {
+                              this.phase = Phase.EXECUTING_STEPS;
+                              this.ticksInPhase = 0;
                           }
-                      } else {
-                          this.verificationTicksRemaining--;
-                          if (this.verificationTicksRemaining <= 0) {
-                              reconcileCursorIfNeeded(client, player);
-                              closeTemporaryInventoryIfNeeded(client);
-                              resetState();
-                              if (config.isShowOperationStatusMessages()) {
-                                  sendHudMessage(player, Text.translatable("message.totemsnap.rejected").formatted(Formatting.RED));
+                      }
+                      case EXECUTING_STEPS -> {
+                          if (this.stepIndex < this.pendingSteps.size()) {
+                              SwapPlan.ClickStep step = this.pendingSteps.get(this.stepIndex);
+                              SlotActionType actionType = step.actionKind() == SwapPlan.ActionKind.HOTBAR_SWAP
+                                      ? SlotActionType.SWAP
+                                      : SlotActionType.PICKUP;
+                              try {
+                                  interactionManager.clickSlot(
+                                          player.playerScreenHandler.syncId,
+                                          step.handlerSlot(),
+                                          step.button(),
+                                          actionType,
+                                          player
+                                  );
+                                  this.stepIndex++;
+                              } catch (Exception ex) {
+                                  TotemSnapMod.LOGGER.warn("TotemSnap clickSlot failed safely", ex);
+                                  reconcileCursorIfNeeded(client, player);
+                                  closeInventoryScreen(client);
+                                  resetState();
+                                  return;
+                              }
+                          }
+                          if (this.stepIndex >= this.pendingSteps.size()) {
+                              this.phase = Phase.VERIFYING_OFFHAND;
+                              this.ticksInPhase = 0;
+                          }
+                      }
+                      case VERIFYING_OFFHAND -> {
+                          reconcileCursorIfNeeded(client, player);
+                          if (player.getOffHandStack().isOf(Items.TOTEM_OF_UNDYING)
+                                  && player.playerScreenHandler.getCursorStack().isEmpty()) {
+                              this.phase = Phase.CLOSING_SCREEN;
+                              this.ticksInPhase = 0;
+                          } else {
+                              this.ticksInPhase++;
+                              if (this.ticksInPhase >= VERIFICATION_TIMEOUT_TICKS) {
+                                  reconcileCursorIfNeeded(client, player);
+                                  closeInventoryScreen(client);
+                                  resetState();
                               }
                           }
                       }
+                      case CLOSING_SCREEN -> {
+                          this.ticksInPhase++;
+                          if (this.ticksInPhase >= CLOSE_DELAY_TICKS) {
+                              closeInventoryScreen(client);
+                              resetState();
+                          }
+                      }
+                      default -> resetState();
                   }
               }
 
               public void tryActivateOnce(MinecraftClient client) {
+                  if (this.phase != Phase.IDLE) {
+                      return;
+                  }
+
                   TotemSnapConfig config = this.configManager.getConfig();
                   if (!config.isEnabled()) {
-                      resetState();
                       return;
                   }
 
                   ClientPlayerEntity player = client.player;
                   ClientPlayerInteractionManager interactionManager = client.interactionManager;
                   if (player == null || interactionManager == null || client.world == null || client.getNetworkHandler() == null) {
-                      resetState();
                       return;
                   }
 
                   if (player.isDead() || player.isSpectator()) {
-                      resetState();
                       return;
                   }
 
@@ -1099,7 +1201,7 @@ jobs:
                       return;
                   }
 
-                  if (player.currentScreenHandler != player.playerScreenHandler || this.awaitingServerVerification) {
+                  if (player.currentScreenHandler != player.playerScreenHandler) {
                       return;
                   }
 
@@ -1107,79 +1209,44 @@ jobs:
                   SwapPlan plan = SwapPlanner.planSwap(snapshot, config.isEnabled(), config.isPreferHotbarTotem());
 
                   switch (plan.outcome()) {
-                      case DISABLED -> resetState();
-                      case ALREADY_IN_OFFHAND -> {
-                          if (config.isShowOperationStatusMessages()) {
-                              sendHudMessage(player, Text.translatable("message.totemsnap.already_equipped").formatted(Formatting.GRAY));
-                          }
+                      case DISABLED, ALREADY_IN_OFFHAND, UNSAFE_CURSOR_OR_NO_SPACE -> {
+                          // No swap needed or cursor currently holds an item
                       }
                       case NO_TOTEM_FOUND -> {
                           if (config.isShowMissingTotemMessage()) {
-                              sendHudMessage(player, Text.translatable("message.totemsnap.no_totem").formatted(Formatting.RED));
+                              String msg = config.getMissingTotemMessage();
+                              sendHudMessage(player, Text.literal(msg).formatted(Formatting.RED));
                           }
                       }
-                      case UNSAFE_CURSOR_OR_NO_SPACE -> {
-                          if (config.isShowOperationStatusMessages()) {
-                              sendHudMessage(player, Text.translatable("message.totemsnap.no_space").formatted(Formatting.GOLD));
-                          }
-                      }
-                      case EXECUTE_SWAP -> executeSwapPlan(client, interactionManager, player, plan, inventoryAlreadyOpen);
+                      case EXECUTE_SWAP -> beginSwapSequence(client, player, plan, inventoryAlreadyOpen);
                   }
               }
 
-              private void executeSwapPlan(
+              private void beginSwapSequence(
                       MinecraftClient client,
-                      ClientPlayerInteractionManager interactionManager,
                       ClientPlayerEntity player,
                       SwapPlan plan,
                       boolean inventoryAlreadyOpen
               ) {
-                  boolean openedNow = false;
-                  try {
-                      if (!inventoryAlreadyOpen && client.currentScreen == null) {
-                          client.setScreen(new InventoryScreen(player));
-                          openedNow = true;
-                      }
+                  this.pendingSteps.clear();
+                  this.pendingSteps.addAll(plan.steps());
+                  this.stepIndex = 0;
+                  this.ticksInPhase = 0;
 
-                      PlayerScreenHandler handler = player.playerScreenHandler;
-                      int syncId = handler.syncId;
-
-                      for (SwapPlan.ClickStep step : plan.steps()) {
-                          SlotActionType actionType = step.actionKind() == SwapPlan.ActionKind.HOTBAR_SWAP
-                                  ? SlotActionType.SWAP
-                                  : SlotActionType.PICKUP;
-                          interactionManager.clickSlot(syncId, step.handlerSlot(), step.button(), actionType, player);
-                      }
-
-                      reconcileCursorIfNeeded(client, player);
-
-                      if (player.getOffHandStack().isOf(Items.TOTEM_OF_UNDYING) && handler.getCursorStack().isEmpty()) {
-                          if (openedNow) {
-                              player.closeHandledScreen();
-                          }
-                          resetState();
-                          if (this.configManager.getConfig().isShowOperationStatusMessages()) {
-                              sendHudMessage(player, Text.translatable("message.totemsnap.swapped").formatted(Formatting.AQUA));
-                          }
-                      } else {
-                          this.openedInventoryTemporarily = openedNow;
-                          this.awaitingServerVerification = true;
-                          this.verificationTicksRemaining = VERIFICATION_TIMEOUT_TICKS;
-                      }
-                  } catch (Exception ex) {
-                      TotemSnapMod.LOGGER.warn("TotemSnap swap interaction failed safely", ex);
-                      if (openedNow) {
-                          closeTemporaryInventoryIfNeeded(client);
-                      }
-                      resetState();
+                  if (!inventoryAlreadyOpen) {
+                      // Visibly open the normal vanilla Minecraft inventory screen first
+                      client.setScreen(new InventoryScreen(player));
+                      this.phase = Phase.OPENING_SCREEN;
+                  } else {
+                      // Already open: keep current InventoryScreen open and execute directly on next tick
+                      this.phase = Phase.EXECUTING_STEPS;
                   }
               }
 
-              private void closeTemporaryInventoryIfNeeded(MinecraftClient client) {
-                  if (!this.openedInventoryTemporarily || client == null) {
+              private void closeInventoryScreen(MinecraftClient client) {
+                  if (client == null) {
                       return;
                   }
-                  this.openedInventoryTemporarily = false;
                   if (client.player != null && client.currentScreen instanceof InventoryScreen) {
                       client.player.closeHandledScreen();
                   } else if (client.currentScreen instanceof InventoryScreen) {
@@ -1247,6 +1314,7 @@ jobs:
           import net.minecraft.client.gui.DrawContext;
           import net.minecraft.client.gui.screen.Screen;
           import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.client.gui.widget.TextFieldWidget;
           import net.minecraft.client.input.KeyInput;
           import net.minecraft.client.util.InputUtil;
           import net.minecraft.screen.ScreenTexts;
@@ -1255,15 +1323,6 @@ jobs:
           import org.lwjgl.glfw.GLFW;
 
           public final class TotemSnapConfigScreen extends Screen {
-              // Dark slate interface with restrained cyan accents
-              private static final int COLOR_BG_TOP = 0xF00D1117;
-              private static final int COLOR_BG_BOTTOM = 0xF0161B22;
-              private static final int COLOR_PANEL_FILL = 0xCC111822;
-              private static final int COLOR_CYAN_ACCENT = 0xFF00D4FF;
-              private static final int COLOR_CYAN_MUTED = 0xFF1F6E8C;
-              private static final int COLOR_TEXT_PRIMARY = 0xFFE6EDF3;
-              private static final int COLOR_TEXT_SECONDARY = 0xFF8B949E;
-
               private final Screen parent;
               private final TotemSnapConfigManager configManager;
               private final TotemSnapConfig workingCopy;
@@ -1272,9 +1331,8 @@ jobs:
 
               private ButtonWidget masterToggleButton;
               private ButtonWidget keybindButton;
-              private ButtonWidget missingMessageButton;
-              private ButtonWidget statusMessageButton;
-              private ButtonWidget preferHotbarButton;
+              private ButtonWidget missingMessageToggleButton;
+              private TextFieldWidget missingMessageField;
 
               public TotemSnapConfigScreen(Screen parent) {
                   super(Text.translatable("screen.totemsnap.config.title"));
@@ -1285,68 +1343,56 @@ jobs:
 
               @Override
               protected void init() {
-                  int panelWidth = 260;
-                  int buttonWidth = 236;
-                  int buttonHeight = 20;
+                  int widthBtn = 200;
+                  int heightBtn = 20;
                   int centerX = this.width / 2;
-                  int startY = Math.max(52, (this.height - 210) / 2);
+                  int startY = this.height / 4;
 
                   this.masterToggleButton = ButtonWidget.builder(getMasterToggleText(), btn -> {
                       this.workingCopy.setEnabled(!this.workingCopy.isEnabled());
                       this.listeningForKey = false;
                       refreshButtonLabels();
-                  }).dimensions(centerX - buttonWidth / 2, startY, buttonWidth, buttonHeight).build();
+                  }).dimensions(centerX - widthBtn / 2, startY, widthBtn, heightBtn).build();
 
                   this.keybindButton = ButtonWidget.builder(getKeybindButtonText(), btn -> {
                       this.listeningForKey = !this.listeningForKey;
                       refreshButtonLabels();
-                  }).dimensions(centerX - buttonWidth / 2, startY + 26, buttonWidth, buttonHeight).build();
+                  }).dimensions(centerX - widthBtn / 2, startY + 24, widthBtn, heightBtn).build();
 
-                  this.missingMessageButton = ButtonWidget.builder(getMissingMessageText(), btn -> {
+                  this.missingMessageToggleButton = ButtonWidget.builder(getMissingMessageText(), btn -> {
                       this.workingCopy.setShowMissingTotemMessage(!this.workingCopy.isShowMissingTotemMessage());
                       this.listeningForKey = false;
                       refreshButtonLabels();
-                  }).dimensions(centerX - buttonWidth / 2, startY + 52, buttonWidth, buttonHeight).build();
+                  }).dimensions(centerX - widthBtn / 2, startY + 48, widthBtn, heightBtn).build();
 
-                  this.statusMessageButton = ButtonWidget.builder(getStatusMessageText(), btn -> {
-                      this.workingCopy.setShowOperationStatusMessages(!this.workingCopy.isShowOperationStatusMessages());
-                      this.listeningForKey = false;
-                      refreshButtonLabels();
-                  }).dimensions(centerX - buttonWidth / 2, startY + 78, buttonWidth, buttonHeight).build();
+                  this.missingMessageField = new TextFieldWidget(
+                          this.textRenderer,
+                          centerX - widthBtn / 2,
+                          startY + 84,
+                          widthBtn,
+                          heightBtn,
+                          Text.literal("Missing Totem Message")
+                  );
+                  this.missingMessageField.setMaxLength(120);
+                  this.missingMessageField.setText(this.workingCopy.getMissingTotemMessage());
+                  this.missingMessageField.setChangedListener(this.workingCopy::setMissingTotemMessage);
 
-                  this.preferHotbarButton = ButtonWidget.builder(getPreferHotbarText(), btn -> {
-                      this.workingCopy.setPreferHotbarTotem(!this.workingCopy.isPreferHotbarTotem());
-                      this.listeningForKey = false;
-                      refreshButtonLabels();
-                  }).dimensions(centerX - buttonWidth / 2, startY + 104, buttonWidth, buttonHeight).build();
-
-                  ButtonWidget restoreDefaultsButton = ButtonWidget.builder(
-                          Text.translatable("button.totemsnap.restore_defaults"),
-                          btn -> {
-                              this.workingCopy.restoreDefaults();
-                              this.listeningForKey = false;
-                              refreshButtonLabels();
-                          }
-                  ).dimensions(centerX - buttonWidth / 2, startY + 134, buttonWidth, buttonHeight).build();
-
-                  int halfWidth = (buttonWidth - 8) / 2;
-                  ButtonWidget saveButton = ButtonWidget.builder(
-                          Text.translatable("button.totemsnap.save").formatted(Formatting.AQUA),
+                  int halfWidth = (widthBtn - 8) / 2;
+                  ButtonWidget doneButton = ButtonWidget.builder(
+                          ScreenTexts.DONE,
                           btn -> saveAndClose()
-                  ).dimensions(centerX - buttonWidth / 2, startY + 162, halfWidth, buttonHeight).build();
+                  ).dimensions(centerX - widthBtn / 2, startY + 118, halfWidth, heightBtn).build();
 
                   ButtonWidget cancelButton = ButtonWidget.builder(
                           ScreenTexts.CANCEL,
                           btn -> close()
-                  ).dimensions(centerX - buttonWidth / 2 + halfWidth + 8, startY + 162, halfWidth, buttonHeight).build();
+                  ).dimensions(centerX - widthBtn / 2 + halfWidth + 8, startY + 118, halfWidth, heightBtn).build();
 
                   this.addDrawableChild(this.masterToggleButton);
                   this.addDrawableChild(this.keybindButton);
-                  this.addDrawableChild(this.missingMessageButton);
-                  this.addDrawableChild(this.statusMessageButton);
-                  this.addDrawableChild(this.preferHotbarButton);
-                  this.addDrawableChild(restoreDefaultsButton);
-                  this.addDrawableChild(saveButton);
+                  this.addDrawableChild(this.missingMessageToggleButton);
+                  this.addDrawableChild(this.missingMessageField);
+                  this.addDrawableChild(doneButton);
                   this.addDrawableChild(cancelButton);
               }
 
@@ -1357,63 +1403,43 @@ jobs:
                   if (this.keybindButton != null) {
                       this.keybindButton.setMessage(getKeybindButtonText());
                   }
-                  if (this.missingMessageButton != null) {
-                      this.missingMessageButton.setMessage(getMissingMessageText());
-                  }
-                  if (this.statusMessageButton != null) {
-                      this.statusMessageButton.setMessage(getStatusMessageText());
-                  }
-                  if (this.preferHotbarButton != null) {
-                      this.preferHotbarButton.setMessage(getPreferHotbarText());
+                  if (this.missingMessageToggleButton != null) {
+                      this.missingMessageToggleButton.setMessage(getMissingMessageText());
                   }
               }
 
               private Text getMasterToggleText() {
-                  Text state = this.workingCopy.isEnabled()
-                          ? Text.literal("ON").formatted(Formatting.AQUA)
-                          : Text.literal("OFF").formatted(Formatting.RED);
-                  return Text.translatable("option.totemsnap.enabled").append(Text.literal(": ")).append(state);
+                  return ScreenTexts.composeToggleText(
+                          Text.translatable("option.totemsnap.enabled"),
+                          this.workingCopy.isEnabled()
+                  );
               }
 
               private Text getKeybindButtonText() {
                   if (this.listeningForKey) {
                       return Text.translatable("option.totemsnap.keybind")
                               .append(Text.literal(": "))
-                              .append(Text.literal("> Press any key (ESC to cancel) <").formatted(Formatting.AQUA));
+                              .append(Text.literal("> ").formatted(Formatting.YELLOW))
+                              .append(InputUtil.fromTranslationKey(this.workingCopy.getBoundKeyTranslationKey()).getLocalizedText().copy().formatted(Formatting.YELLOW))
+                              .append(Text.literal(" <").formatted(Formatting.YELLOW));
                   }
                   InputUtil.Key key = InputUtil.fromTranslationKey(this.workingCopy.getBoundKeyTranslationKey());
                   return Text.translatable("option.totemsnap.keybind")
                           .append(Text.literal(": "))
-                          .append(key.getLocalizedText().copy().formatted(Formatting.AQUA));
+                          .append(key.getLocalizedText());
               }
 
               private Text getMissingMessageText() {
-                  Text state = this.workingCopy.isShowMissingTotemMessage()
-                          ? Text.literal("ON").formatted(Formatting.AQUA)
-                          : Text.literal("OFF").formatted(Formatting.GRAY);
-                  return Text.translatable("option.totemsnap.show_missing_message").append(Text.literal(": ")).append(state);
-              }
-
-              private Text getStatusMessageText() {
-                  Text state = this.workingCopy.isShowOperationStatusMessages()
-                          ? Text.literal("ON").formatted(Formatting.AQUA)
-                          : Text.literal("OFF").formatted(Formatting.GRAY);
-                  return Text.translatable("option.totemsnap.show_status_messages").append(Text.literal(": ")).append(state);
-              }
-
-              private Text getPreferHotbarText() {
-                  Text state = this.workingCopy.isPreferHotbarTotem()
-                          ? Text.literal("Hotbar First").formatted(Formatting.AQUA)
-                          : Text.literal("Inventory First").formatted(Formatting.GRAY);
-                  return Text.translatable("option.totemsnap.prefer_hotbar").append(Text.literal(": ")).append(state);
+                  return ScreenTexts.composeToggleText(
+                          Text.translatable("option.totemsnap.show_missing_message"),
+                          this.workingCopy.isShowMissingTotemMessage()
+                  );
               }
 
               @Override
               public boolean keyPressed(KeyInput input) {
                   if (this.listeningForKey) {
-                      int keyCode = input.key();
-                      int scanCode = input.scancode();
-                      if (keyCode == GLFW.GLFW_KEY_ESCAPE) {
+                      if (input.key() == GLFW.GLFW_KEY_ESCAPE) {
                           this.listeningForKey = false;
                       } else {
                           InputUtil.Key newKey = InputUtil.fromKeyCode(input);
@@ -1442,6 +1468,9 @@ jobs:
               }
 
               private void saveAndClose() {
+                  if (this.missingMessageField != null) {
+                      this.workingCopy.setMissingTotemMessage(this.missingMessageField.getText());
+                  }
                   this.configManager.updateAndSave(this.workingCopy);
                   TotemSnapClient clientMod = TotemSnapClient.getInstance();
                   if (clientMod != null) {
@@ -1465,37 +1494,17 @@ jobs:
 
               @Override
               public void render(DrawContext context, int mouseX, int mouseY, float deltaTicks) {
-                  context.fillGradient(0, 0, this.width, this.height, COLOR_BG_TOP, COLOR_BG_BOTTOM);
-
-                  int panelWidth = 264;
-                  int panelHeight = 228;
-                  int panelX = (this.width - panelWidth) / 2;
-                  int panelY = Math.max(16, (this.height - 210) / 2 - 36);
-
-                  // Dark slate card with restrained cyan border accents
-                  context.fill(panelX, panelY, panelX + panelWidth, panelY + panelHeight, COLOR_PANEL_FILL);
-                  context.fill(panelX, panelY, panelX + panelWidth, panelY + 2, COLOR_CYAN_ACCENT);
-                  context.fill(panelX, panelY + panelHeight - 1, panelX + panelWidth, panelY + panelHeight, COLOR_CYAN_MUTED);
-                  context.fill(panelX, panelY, panelX + 1, panelY + panelHeight, COLOR_CYAN_MUTED);
-                  context.fill(panelX + panelWidth - 1, panelY, panelX + panelWidth, panelY + panelHeight, COLOR_CYAN_MUTED);
-
-                  context.drawCenteredTextWithShadow(
-                          this.textRenderer,
-                          this.title,
-                          this.width / 2,
-                          panelY + 10,
-                          COLOR_TEXT_PRIMARY
-                  );
-
-                  context.drawCenteredTextWithShadow(
-                          this.textRenderer,
-                          Text.translatable("screen.totemsnap.config.subtitle"),
-                          this.width / 2,
-                          panelY + 22,
-                          COLOR_TEXT_SECONDARY
-                  );
-
                   super.render(context, mouseX, mouseY, deltaTicks);
+                  context.drawCenteredTextWithShadow(this.textRenderer, this.title, this.width / 2, 20, 0xFFFFFF);
+                  if (this.missingMessageField != null) {
+                      context.drawTextWithShadow(
+                              this.textRenderer,
+                              Text.literal("Missing Totem Message:"),
+                              this.width / 2 - 100,
+                              this.height / 4 + 73,
+                              0xA0A0A0
+                      );
+                  }
               }
           }
           """)
